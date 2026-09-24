@@ -7,6 +7,7 @@
 #   1. 部门共享文件夹 → 本机 nas-sim\AI资材 等（由 .env.local 的 NAS_VOLUME 决定）
 #   2. 平台数据       → 本机 data-local\（和 NAS 的 data\ 完全分开，互不覆盖）
 #   3. 费用闸门       → 默认打开模拟模式（GATE_MOCK=1），没有智谱 key 也能测
+#   4. 办公版终端镜像 → 只在本机构建（菜单 A 用下面 term-zc 的 build 配置；四个部门终端共用这个镜像）
 # ==========================================================================
 services:
   init-folders:
@@ -24,3 +25,13 @@ services:
   open-webui:
     volumes:
       - ./data-local/open-webui:/app/backend/data
+
+  # 办公版终端镜像的构建配置只放在本机（NAS 不构建，镜像从文件导入）
+  term-zc:
+    build:
+      context: ./term-image
+      args:
+        BASE_IMAGE: ${IMAGE_TERMINAL}
+        # 容器内运行账号 = 群晖终端服务账号（DSM 里 `id <服务账号>` 查到的 uid/gid）
+        TERM_UID: ${TERM_UID:-1000}
+        TERM_GID: ${TERM_GID:-100}

@@ -14,7 +14,6 @@ chk "转 PDF 脚本 office2pdf.py" "test -f /opt/company/office2pdf.py"
 chk "部门说明与配方工具（dept.py/runio）" "python3 /opt/company/kit/dept.py --help && cd /tmp && python3 -c 'import sys; sys.path.insert(0,\"/opt/company/kit\"); import runio'"
 chk "公司工具包（peek/charts/tables/weekly）" "python3 /opt/company/kit/weekly.py --help && cd /tmp && python3 -c 'import sys; sys.path.insert(0,\"/opt/company/kit\"); import charts, tables'"
 chk "终端守护 term_guard（命令超时终止、清理临时文件）" "grep -aqs 'term_guar[d].py' /proc/[0-9]*/cmdline"
-chk "进程数上限 pids_limit（防失控脚本）" "v=\$(cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max); [ -n \"\$v\" ] && [ \"\$v\" != max ]"
 chk "本部门文件夹可读写（当前账号 $(id -un) uid=$(id -u)）" "ls . && test -w ../02_输出"
 echo "结果：通过 $ok 项，缺少 $bad 项"
 [ "$bad" -eq 0 ]

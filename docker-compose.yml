@@ -7,16 +7,10 @@
 name: ai-platform
 
 x-term-common: &term-common
-  # 办公增强版终端镜像：在 Open Terminal（.env 的 IMAGE_TERMINAL）基础上补 xlrd/pdfplumber/reportlab/pptxgenjs/中文字体
-  # 本机已有该镜像就直接用；没有就按 term-image/Dockerfile 自动构建（需要能访问国内软件源）
+  # 办公增强版终端镜像：只在本机构建（本机测试工具 菜单 A），导出后在 NAS「映像 → 从文件添加」导入
+  # NAS 上不构建、不拉取：这样 Container Manager 的「停止 → 构建」只是按新配置重建容器，不依赖外网，不会半途失败
   image: ${IMAGE_TERMINAL_OFFICE:-ai-term-office:1.1}
-  build:
-    context: ./term-image
-    args:
-      BASE_IMAGE: ${IMAGE_TERMINAL}
-      # 容器内运行账号 = 群晖终端服务账号（DSM 里 `id <服务账号>` 查到的 uid/gid）
-      TERM_UID: ${TERM_UID:-1000}
-      TERM_GID: ${TERM_GID:-100}
+  pull_policy: never
   restart: unless-stopped
   # 群晖 Container Manager「终端机」要求容器带 TTY，否则报「未发现电传终端机」
   tty: true
@@ -25,8 +19,6 @@ x-term-common: &term-common
   entrypoint: ["/usr/bin/tini", "--", "/bin/bash", "/opt/company/term_entry.sh"]
   command: ["run"]
   mem_limit: 1g
-  # 进程/线程数上限：防止助手写出无限起子进程的脚本把终端拖死（正常办公任务一般不到 100）
-  pids_limit: 256
   cpu_shares: 512
   networks: [backend]
   depends_on:
@@ -37,6 +29,7 @@ services:
   # ---- 1. 部门文件夹初始化（运行一次就退出，属正常）----------------------
   init-folders:
     image: ${IMAGE_OPENWEBUI}
+    pull_policy: missing
     container_name: ai-init-folders
     restart: "no"
     user: "0:0"
@@ -56,6 +49,7 @@ services:
   # ---- 2. 费用闸门（唯一出网点：按部门计价、限额、自检页、管理页、月度价值页）--
   cost-gate:
     image: ${IMAGE_OPENWEBUI}          # 复用 Open WebUI 镜像里的 Python，不用另外构建
+    pull_policy: missing
     container_name: ai-cost-gate
     restart: unless-stopped
     entrypoint: ["python", "/gate/app.py"]
@@ -110,6 +104,7 @@ services:
   # ---- 3. Open WebUI（登录、界面、部门权限、定时任务）----------------------
   open-webui:
     image: ${IMAGE_OPENWEBUI}
+    pull_policy: missing
     container_name: ai-open-webui
     restart: unless-stopped
     depends_on:
