@@ -9,7 +9,7 @@
 |---|---|
 | 整理/清洗数据、汇总统计、出图、出 Excel 汇总表 | `/opt/company/skills/公司-数据处理与出图/SKILL.md` |
 | 周报（先了解部门现在的做法，再照做 → PDF） | `/opt/company/skills/公司-周报PPT/SKILL.md` |
-| 记住口径、存成配方、按上次的做法再做、用部门配方 | `/opt/company/skills/公司-部门说明与配方/SKILL.md` |
+| 记住口径、改口径、复核或整理部门说明、存成配方、按上次的做法再做、用部门配方 | `/opt/company/skills/公司-部门说明与配方/SKILL.md` |
 | Excel 的特殊操作：改公式、改格式、在原文件上插行插列、公式检查 | `/opt/company/skills/minimax-xlsx/SKILL.md` |
 | 专题汇报 PPT、周报的 PPT 制作 | `/opt/company/skills/pptx-generator/SKILL.md` |
 | 新建或修改 Word（.docx） | `/opt/company/skills/doc/SKILL.md` |

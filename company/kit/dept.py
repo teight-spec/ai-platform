@@ -7,6 +7,10 @@ dept.py —— 部门说明 + 部门配方
 
     python3 /opt/company/kit/dept.py start                         任务开始先跑：部门说明 + 配方清单（一次看全）
     python3 /opt/company/kit/dept.py note --section 字段口径 --by 张三 "入库金额 = 数量 × 含税单价，不含退货"
+    python3 /opt/company/kit/dept.py note-list                      部门说明全部条目（带编号、字数、最近复核）
+    python3 /opt/company/kit/dept.py note --replace 入库金额 --by 张三 "入库金额 = …"   改写（名称或编号；旧内容记入修改记录）
+    python3 /opt/company/kit/dept.py note-del 3 5 --by 张三          删除（用户同意后；记入修改记录）
+    python3 /opt/company/kit/dept.py note-review --by 张三           用户看过全部条目后记一次复核
     python3 /opt/company/kit/dept.py recipe-save --name 月度入库汇总 --from <任务输出目录> --desc "一句话说明" --by 张三
     python3 /opt/company/kit/dept.py recipe-list
     python3 /opt/company/kit/dept.py recipe-run 月度入库汇总 --input 新文件.xlsx [--user 张三] [--out 目录]
@@ -64,10 +68,19 @@ def today():
 
 
 # ----------------------------------------------------------------- 部门说明
+# 篇幅上限：部门说明每次任务都会读进对话，越长越费钱，也越容易前后矛盾。超过上限时先合并精简再写新条目。
+NOTES_MAX_CHARS = int(os.getenv("AI_NOTES_MAX_CHARS", "3000"))
+REVIEW_DAYS = 31  # 超过这么多天没复核，start 会提醒
+NOTES_LOG = os.path.join("05_模板", "部门说明_修改记录.md")
+REVIEW_RE = re.compile(r"^<!-- 最近复核：(\d{4}-\d{2}-\d{2})\s*(.*?)\s*-->$", re.M)
+SUFFIX_RE = re.compile(r"（\d{4}-\d{2}-\d{2}[^（）]*确认）$")
+KEY_RE = re.compile(r"^(.{1,20}?)\s*(?:=|＝|：|:)")
+
+
 def notes_template(dept_name):
     body = [f"# {dept_name}部门说明", "", f"<!-- {MARK} -->",
-            "助手每次任务前会读本文件。只写和用户确认过的内容，每条注明日期和确认人；保持简短（建议 100 行以内）。",
-            "要修改或删除某条，直接编辑本文件即可。", ""]
+            f"助手每次任务前会读本文件。只写和用户确认过的内容，每条注明日期和确认人；保持简短（上限约 {NOTES_MAX_CHARS} 字）。",
+            "要修改或删除某条，可以直接编辑本文件，也可以让助手用 dept.py note-list / note-del / note --replace。", ""]
     for s in SECTIONS:
         body += [f"## {s}", ""]
     return "\n".join(body)
@@ -77,22 +90,111 @@ def count_items(text):
     return sum(1 for ln in text.splitlines() if ln.lstrip().startswith("- "))
 
 
+def note_items(text):
+    """[(编号, 行号, 小节, 条目正文(不含日期后缀), 整行)]，编号从 1 开始，按文件顺序"""
+    out, sec = [], ""
+    for i, ln in enumerate(text.splitlines()):
+        if ln.startswith("## "):
+            sec = ln[3:].strip()
+        elif ln.lstrip().startswith("- "):
+            body = ln.lstrip()[2:].strip()
+            out.append((len(out) + 1, i, sec, SUFFIX_RE.sub("", body).strip(), ln))
+    return out
+
+
+def notes_chars(text):
+    """只算条目本身的字数（标题、说明文字不算）"""
+    return sum(len(it[4].strip()) for it in note_items(text))
+
+
+def item_key(text):
+    """「入库金额 = 数量 × 单价」→「入库金额」；没有「=」「：」时返回 None"""
+    m = KEY_RE.match(text.strip())
+    return m.group(1).strip() if m else None
+
+
+def last_review(text):
+    m = REVIEW_RE.search(text or "")
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def _notes_path(root):
+    return os.path.join(root, NOTES)
+
+
+def _load_notes(root):
+    p = _notes_path(root)
+    return open(p, encoding="utf-8").read() if os.path.isfile(p) else None
+
+
+def _save_notes(root, text):
+    p = _notes_path(root)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(text.rstrip() + "\n")
+
+
+def _log(root, action, detail, by):
+    """部门说明的修改/删除/复核留痕（可追溯）：05_模板/部门说明_修改记录.md"""
+    p = os.path.join(root, NOTES_LOG)
+    head = "" if os.path.isfile(p) else f"# 部门说明修改记录\n\n<!-- {MARK} -->\n\n"
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(f"{head}- {dt.datetime.now():%Y-%m-%d %H:%M} {by or '未注明'} {action}：{detail}\n")
+
+
+def _size_line(chars):
+    return f"{chars} / {NOTES_MAX_CHARS} 字"
+
+
 def cmd_note(a):
     root = find_dept_dir(a.dept_dir)
-    if a.section not in SECTIONS:
-        raise SystemExit(f"--section 只能是：{'、'.join(SECTIONS)}")
     text = " ".join(a.text).strip().replace("\n", " ")
     if not text:
         raise SystemExit("内容为空")
-    p = os.path.join(root, NOTES)
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    doc = open(p, encoding="utf-8").read() if os.path.isfile(p) else notes_template(os.path.basename(root))
-    if re.search(r"^- " + re.escape(text) + r"（", doc, re.M):
+    doc = _load_notes(root) or notes_template(os.path.basename(root))
+    items = note_items(doc)
+    old = None
+    if a.replace:
+        r = a.replace.strip().lstrip("#")
+        if r.isdigit():
+            old = next((it for it in items if it[0] == int(r)), None)
+            if not old:
+                raise SystemExit(f"没有第 {r} 条（先用 note-list 看编号）")
+        else:  # 按名称改写：「入库金额」
+            hit = [it for it in items if item_key(it[3]) == r]
+            if len(hit) != 1:
+                raise SystemExit(f"按名称「{r}」找到 {len(hit)} 条，请改用编号（note-list 看编号）")
+            old = hit[0]
+        if item_key(old[3]) and item_key(text) and item_key(old[3]) != item_key(text):
+            raise SystemExit(f"第 {old[0]} 条是「{item_key(old[3])}」，新内容是「{item_key(text)}」，名称对不上，没有改写。"
+                             "请先用 note-list 核对编号。")
+    section = a.section or (old[2] if old else None)
+    if section not in SECTIONS:
+        raise SystemExit(f"--section 只能是：{'、'.join(SECTIONS)}")
+    if not old and any(it[3] == text for it in items):
         print(f"已有相同条目，未重复写入：{text}")
         return
+    key = item_key(text)
+    if not old and key:
+        same = [it for it in items if item_key(it[3]) == key]
+        if same:
+            print(f"「{key}」已经有口径，没有写入（避免前后矛盾）：")
+            for it in same:
+                print(f"  #{it[0]}〔{it[2]}〕{it[4].strip()[2:]}")
+            print(f"如果是改口径：先和用户确认，再用 note --replace {key} \"新内容\"（旧内容会记进修改记录）；"
+                  "如果说的是另一回事，把名称写得更具体再记。")
+            return 3
     line = f"- {text}（{today()} {a.by or '未注明'}确认）"
+    new_chars = notes_chars(doc) - (len(old[4].strip()) if old else 0) + len(line)
+    if new_chars > NOTES_MAX_CHARS:
+        print(f"部门说明已接近篇幅上限（写入后 {_size_line(new_chars)}），这条没有写入：{text}")
+        print("请和用户一起精简：note-list 看全部条目 → 合并同类（note --replace 编号 \"合并后的内容\"）、"
+              "删掉过时的（note-del 编号）→ 再写这条。")
+        return 4
     lines = doc.splitlines()
-    head = f"## {a.section}"
+    if old:
+        del lines[old[1]]
+    head = f"## {section}"
     if head not in lines:
         lines += ["", head, ""]
     i = lines.index(head) + 1
@@ -103,13 +205,70 @@ def cmd_note(a):
     while k > i and not lines[k - 1].strip():
         k -= 1
     lines.insert(k, line)
-    out = "\n".join(lines).rstrip() + "\n"
-    with open(p, "w", encoding="utf-8") as f:
-        f.write(out)
-    print(f"已写入 {NOTES}「{a.section}」：{line}")
-    n = count_items(out)
-    if len(out.splitlines()) > 100:
-        print(f"提示：部门说明已有 {len(out.splitlines())} 行（{n} 条），建议请用户合并精简，太长会增加每次对话的费用。")
+    out = "\n".join(lines)
+    _save_notes(root, out)
+    if old:
+        _log(root, "修改", f"#{old[0]}〔{old[2]}〕{old[3]} → 〔{section}〕{text}", a.by)
+        print(f"已改写第 {old[0]} 条：{old[3]} → {text}（旧内容已记入 {NOTES_LOG}）")
+    else:
+        print(f"已写入 {NOTES}「{section}」：{line}")
+    chars = notes_chars(out)
+    if chars > NOTES_MAX_CHARS * 0.8:
+        print(f"提示：部门说明已有 {count_items(out)} 条（{_size_line(chars)}），快到上限了，建议请用户合并精简。")
+
+
+def cmd_note_list(a):
+    root = find_dept_dir(a.dept_dir)
+    doc = _load_notes(root)
+    if not doc:
+        print(f"还没有部门说明（{NOTES}）")
+        return
+    items = note_items(doc)
+    d, by = last_review(doc)
+    print(f"{NOTES}：{len(items)} 条，{_size_line(notes_chars(doc))}；最近复核：{(d + ' ' + by).strip() if d else '从未'}")
+    sec = None
+    for it in items:
+        if it[2] != sec:
+            sec = it[2]
+            print(f"\n## {sec}")
+        print(f"  #{it[0]} {it[4].strip()[2:]}")
+
+
+def cmd_note_del(a):
+    root = find_dept_dir(a.dept_dir)
+    doc = _load_notes(root)
+    if not doc:
+        raise SystemExit("还没有部门说明")
+    items = {it[0]: it for it in note_items(doc)}
+    miss = [n for n in a.nums if n not in items]
+    if miss:
+        raise SystemExit(f"没有这些编号：{miss}（先用 note-list 看编号）")
+    lines = doc.splitlines()
+    for n in sorted(set(a.nums), key=lambda n: -items[n][1]):
+        del lines[items[n][1]]
+        _log(root, "删除", f"#{n}〔{items[n][2]}〕{items[n][3]}", a.by)
+        print(f"已删除 #{n}：{items[n][3]}")
+    out = "\n".join(lines)
+    _save_notes(root, out)
+    print(f"现在 {count_items(out)} 条，{_size_line(notes_chars(out))}（删除内容已记入 {NOTES_LOG}）")
+
+
+def cmd_note_review(a):
+    root = find_dept_dir(a.dept_dir)
+    doc = _load_notes(root)
+    if not doc:
+        raise SystemExit("还没有部门说明")
+    mark = f"<!-- 最近复核：{today()} {a.by or '未注明'} -->"
+    if REVIEW_RE.search(doc):
+        doc = REVIEW_RE.sub(mark, doc, count=1)
+    else:
+        lines = doc.splitlines()
+        at = next((i + 1 for i, ln in enumerate(lines) if MARK in ln and ln.startswith("<!--")), 1)
+        lines.insert(at, mark)
+        doc = "\n".join(lines)
+    _save_notes(root, doc)
+    _log(root, "复核", f"全部 {count_items(doc)} 条已看过", a.by)
+    print(f"已记录复核：{today()} {a.by or '未注明'}（{count_items(doc)} 条，{_size_line(notes_chars(doc))}）")
 
 
 # ----------------------------------------------------------------- 配方
@@ -160,11 +319,22 @@ def cmd_start(a):
                     lines.append(head)
                     head = ""
                 lines.append(ln)
-        print(f"\n【部门说明】{NOTES}（{count_items(text)} 条，以下口径已和用户确认过，照此执行）")
+        n, chars = count_items(text), notes_chars(text)
+        d, _ = last_review(text)
+        print(f"\n【部门说明】{NOTES}（{n} 条，{_size_line(chars)}，最近复核 {d or '从未'}；以下口径已和用户确认过，照此执行）")
         for ln in lines[:MAX_PRINT_LINES]:
             print(ln)
         if len(lines) > MAX_PRINT_LINES:
             print(f"……（还有 {len(lines) - MAX_PRINT_LINES} 行，需要时用 cat 看全文；建议请用户精简）")
+        tips = []
+        if chars > NOTES_MAX_CHARS * 0.8:
+            tips.append(f"部门说明快到篇幅上限（{_size_line(chars)}），任务结束时请用户一起合并精简")
+        days = (dt.date.today() - dt.date.fromisoformat(d)).days if d else None
+        if n >= 5 and (days is None or days > REVIEW_DAYS):
+            tips.append(("部门说明还没复核过" if days is None else f"部门说明已 {days} 天没复核") +
+                        "：任务结束时顺便请用户看一遍（note-list），确认没问题后运行 note-review --by <用户名>")
+        for t in tips:
+            print("【提醒】" + t + "（只在最后提一次，不要打断当前任务）")
     else:
         print(f"\n【部门说明】还没有（{NOTES}）。任务中和用户确认的口径，结束时用 note 记下来。")
     rs = recipes(root)
@@ -437,10 +607,17 @@ def main():
     ap.add_argument("--dept-dir", default=None, help="部门文件夹（默认自动找）")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("start", help="任务开始：显示部门说明 + 配方清单")
-    s = sub.add_parser("note", help="往部门说明里记一条确认过的口径")
-    s.add_argument("--section", required=True, help="、".join(SECTIONS))
+    s = sub.add_parser("note", help="往部门说明里记一条确认过的口径（--replace 编号 = 改写某条）")
+    s.add_argument("--section", default=None, help="、".join(SECTIONS) + "（新写时必填；改写时不填 = 放回原小节）")
     s.add_argument("--by", default="", help="确认人")
+    s.add_argument("--replace", default=None, help="改写哪一条：编号（见 note-list）或名称（如 入库金额）")
     s.add_argument("text", nargs="+")
+    s = sub.add_parser("note-list", help="列出部门说明全部条目（带编号、字数、最近复核）")
+    s = sub.add_parser("note-del", help="删除部门说明的某几条（用户同意后）")
+    s.add_argument("nums", type=int, nargs="+")
+    s.add_argument("--by", default="", help="确认人")
+    s = sub.add_parser("note-review", help="记录用户已复核部门说明")
+    s.add_argument("--by", default="", help="复核人")
     s = sub.add_parser("recipe-save", help="把做对的任务存成部门配方")
     s.add_argument("--name", required=True)
     s.add_argument("--from", dest="from_dir", required=True, help="任务输出目录（里面有 script.py 和 结果摘要.json）")
@@ -462,7 +639,8 @@ def main():
     for p in sub.choices.values():
         p.add_argument("--dept-dir", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     a = ap.parse_args()
-    fn = {"start": cmd_start, "note": cmd_note, "recipe-save": cmd_recipe_save, "recipe-list": cmd_recipe_list,
+    fn = {"start": cmd_start, "note": cmd_note, "note-list": cmd_note_list, "note-del": cmd_note_del,
+          "note-review": cmd_note_review, "recipe-save": cmd_recipe_save, "recipe-list": cmd_recipe_list,
           "recipe-run": cmd_recipe_run, "recipe-check": cmd_recipe_check}[a.cmd]
     sys.exit(fn(a) or 0)
 

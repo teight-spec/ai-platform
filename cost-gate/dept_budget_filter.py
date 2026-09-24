@@ -1,8 +1,8 @@
 """
 title: 部门额度显示
 author: AI 平台管理员
-version: 1.1.0
-description: 每次对话前，在回复上方显示「本部门本月已用 ¥x / ¥y · 本对话 ¥a / ¥b」；额度用完时直接提示，不再调用模型。
+version: 1.2.0
+description: 每次对话前，在回复上方显示「本部门本月已用 ¥x / ¥y · 本对话 ¥a / ¥b」；额度用完时直接提示，不再调用模型；对话太长时提示新开对话。
 """
 from pydantic import BaseModel, Field
 import httpx
@@ -13,6 +13,7 @@ class Filter:
         gate_url: str = Field(default="http://cost-gate:8000", description="费用闸门的内部地址")
         dept_codes: str = Field(default="zc,cw,yx,gl", description="部门代码（= 模型连接前缀），逗号分隔")
         priority: int = Field(default=0, description="过滤器执行顺序")
+        long_chat_hint: bool = Field(default=True, description="对话太长时提示员工新开对话，并请助手在本轮结束时收尾")
 
     def __init__(self):
         self.valves = self.Valves()
@@ -24,6 +25,15 @@ class Filter:
             if "." in mid and mid.split(".", 1)[0] in codes:
                 return mid.split(".", 1)[0]
         return None
+
+    @staticmethod
+    def _nudge_model(body: dict):
+        """只影响本次发给模型的内容（不写进对话记录）：请助手做完这一步后收尾"""
+        msgs = body.get("messages") or []
+        if not msgs or msgs[-1].get("role") != "user" or not isinstance(msgs[-1].get("content"), str):
+            return
+        msgs[-1]["content"] += ("\n\n（平台提示，不用单独回复：本对话已经比较长。做完当前这一步后，如有本次新确认的口径，"
+                                "先列出「建议记入部门说明」；再用一句话建议用户点「新对话」继续。）")
 
     async def inlet(self, body: dict, __user__: dict = None, __model__: dict = None, __event_emitter__=None,
                     __metadata__: dict = None) -> dict:
@@ -48,6 +58,10 @@ class Filter:
                                 f"请点「新对话」重新开始（需要的结论可以复制过去，文件都在部门文件夹里）。")
         if s.get("warn"):
             text += "　已超过预警线，请节约使用"
+        hint = s.get("chat_hint") or ""
+        if hint and self.valves.long_chat_hint:
+            text += "　｜　" + hint
+            self._nudge_model(body)
         if __event_emitter__:
             await __event_emitter__({"type": "status", "data": {"description": text, "done": True, "hidden": False}})
         return body

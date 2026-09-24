@@ -21,7 +21,12 @@ x-term-common: &term-common
   # 群晖 Container Manager「终端机」要求容器带 TTY，否则报「未发现电传终端机」
   tty: true
   stdin_open: true
+  # 启动包装：先在后台起守护（命令超过 20 分钟自动终止、每小时清理 /tmp 旧临时文件），再交给原版入口。镜像不用重建
+  entrypoint: ["/usr/bin/tini", "--", "/bin/bash", "/opt/company/term_entry.sh"]
+  command: ["run"]
   mem_limit: 1g
+  # 进程/线程数上限：防止助手写出无限起子进程的脚本把终端拖死（正常办公任务一般不到 100）
+  pids_limit: 256
   cpu_shares: 512
   networks: [backend]
   depends_on:
@@ -73,6 +78,11 @@ services:
       # 用量保护：单个对话累计费用上限（元）、单次请求输入上限（估算 tokens）；0 = 不限
       CHAT_MAX_YUAN: ${CHAT_MAX_YUAN:-5}
       MAX_INPUT_TOKENS: ${MAX_INPUT_TOKENS:-100000}
+      # 工具输出（命令输出、读文件）单条超过这么多字，只把开头和结尾发给模型；0 = 不截断
+      TOOL_OUTPUT_MAX_CHARS: ${TOOL_OUTPUT_MAX_CHARS:-12000}
+      # 长对话提示：上一轮输入 ≥ 这么多 tokens，或本对话费用 ≥ 单对话上限的这个百分比时，提示员工新开对话；0 = 不提示
+      CHAT_HINT_TOKENS: ${CHAT_HINT_TOKENS:-60000}
+      CHAT_HINT_PCT: ${CHAT_HINT_PCT:-60}
       GATE_EXTRA_BODY: '{"thinking":{"type":"enabled","clear_thinking":false}}'
       GATE_DB_PATH: /data/gate.db
       OWUI_URL: http://open-webui:8080
@@ -83,7 +93,7 @@ services:
       - ./cost-gate:/gate:ro
       - ./data/cost-gate:/data
       - ./data/init:/init-report:ro
-      # 月度价值页：部门文件夹只读挂载，只统计 02_输出/03_周报 的文件夹个数、04_技能 的配方数、部门说明条目数，不读文件内容
+      # 月度价值页：部门文件夹只读挂载，只统计 02_输出/03_周报 的文件夹个数、04_技能 的配方数、部门说明的条目数/字数/复核日期
       - ${NAS_VOLUME}/AI资材:/depts/资材:ro
       - ${NAS_VOLUME}/AI财务:/depts/财务:ro
       - ${NAS_VOLUME}/AI营销:/depts/营销:ro
@@ -147,6 +157,13 @@ services:
       ENABLE_DIRECT_CONNECTIONS: "False"
       # 管理员（含总裁办账号）可以查看全部对话
       ENABLE_ADMIN_CHAT_ACCESS: "True"
+      # 关掉 Open WebUI 自带的「个人记忆」：口径统一记在部门文件夹的「部门说明」里（全部门共用、可复核）
+      # 注意：这几项只在第一次启动（新数据库）时生效；已有数据库以「一键初始化」为准，它会再强制关一次
+      ENABLE_MEMORIES: "False"
+      ENABLE_MEMORY_SYSTEM_CONTEXT: "False"
+      USER_PERMISSIONS_FEATURES_MEMORIES: "False"
+      # 单轮对话里助手最多连续调用工具的次数（原版默认 256）：防止模型在一轮里反复试错空转
+      CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS: "50"
     volumes:
       - ./data/open-webui:/app/backend/data
     mem_limit: 2g

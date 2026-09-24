@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -103,6 +104,39 @@ class T02_Dept(unittest.TestCase):
         self.assertIn("2 条", r.stdout)
         self.assertIn("A仓 = 主仓库", r.stdout)
         self.assertNotEqual(self.d("note", "--section", "不存在", "x").returncode, 0)
+
+    def test_notes_conflict_replace_cap(self):
+        self.d("note", "--section", "字段口径", "--by", "张三", "入库金额 = 数量 × 含税单价")
+        r = self.d("note", "--section", "字段口径", "--by", "李四", "入库金额 = 数量 × 不含税单价")
+        self.assertEqual(r.returncode, 3)                      # 同名口径：不写入，列出旧条目
+        self.assertIn("已经有口径", r.stdout)
+        r = self.d("note", "--replace", "入库金额", "--by", "李四", "入库金额 = 数量 × 不含税单价")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        text = open(os.path.join(self.root, "05_模板", "部门说明.md"), encoding="utf-8").read()
+        self.assertIn("不含税单价", text)
+        self.assertNotIn("× 含税单价", text)
+        log = open(os.path.join(self.root, "05_模板", "部门说明_修改记录.md"), encoding="utf-8").read()
+        self.assertIn("× 含税单价", log)                       # 旧内容留痕
+        r = run(self.dept, "--dept-dir", self.root, "note", "--section", "其他", "x" * 50)
+        env = dict(os.environ, AI_NOTES_MAX_CHARS="100")
+        r = subprocess.run([PY, self.dept, "--dept-dir", self.root, "note", "--section", "其他", "y" * 60],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 4)                      # 超过篇幅上限：不写入
+        self.assertIn("篇幅上限", r.stdout)
+
+    def test_notes_list_del_review(self):
+        for i in range(6):
+            self.d("note", "--section", "术语", "--by", "张三", f"词{i} = 含义{i}")
+        self.assertIn("没复核", self.d("start").stdout)          # 5 条以上、从未复核 → 提醒
+        r = self.d("note-list")
+        self.assertIn("#6", r.stdout)
+        r = self.d("note-del", "2", "3", "--by", "张三")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("4 条", r.stdout)
+        self.d("note-review", "--by", "张三")
+        out = self.d("start").stdout
+        self.assertIn("最近复核 20", out)
+        self.assertNotIn("没复核", out)
 
     def test_recipe_cycle(self):
         src_in = sample_xlsx(os.path.join(self.root, "01_原始数据", "入库_0923.xlsx"))
@@ -241,6 +275,42 @@ class T06_Office(unittest.TestCase):
 
     def test_weekly_help(self):
         self.assertEqual(run(os.path.join(KIT, "weekly.py"), "--help").returncode, 0)
+
+
+GUARD_SERVER = r"""
+import subprocess, sys, time
+long = subprocess.Popen("sleep 300 & sleep 301", shell=True, start_new_session=True)
+shell = subprocess.Popen(["/bin/bash"], stdin=subprocess.PIPE, start_new_session=True)
+short = subprocess.Popen("sleep 1", shell=True, start_new_session=True)
+time.sleep(7)
+print("long", long.poll(), "shell", shell.poll(), "short", short.poll(), flush=True)
+shell.kill()
+"""
+
+
+class T09_TermGuard(unittest.TestCase):
+    def test_kill_long_keep_shell_and_clean_tmp(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            old = os.path.join(tmp, "旧临时目录")
+            os.makedirs(old)
+            new = os.path.join(tmp, "新临时目录")
+            os.makedirs(new)
+            t = time.time() - 3 * 86400
+            os.utime(old, (t, t))
+            srv = os.path.join(tmp, "server.py")
+            open(srv, "w", encoding="utf-8").write(GUARD_SERVER)
+            guard = os.path.join(COMPANY, "term_guard.py")
+            sh = f"TERM_CMD_MAX_MIN=0.05 TERM_GUARD_SCAN_SEC=1 TERM_GUARD_TMP={tmp} {PY} {guard} & exec {PY} {srv}"
+            r = subprocess.run(["bash", "-c", sh], capture_output=True, text=True, timeout=60)
+            self.assertIn("long -15", r.stdout, r.stdout + r.stderr)       # 超时命令被终止
+            self.assertIn("shell None", r.stdout)                           # 交互式 shell 不动
+            self.assertIn("short 0", r.stdout)                              # 正常短命令不受影响
+            self.assertIn("终止超时命令", r.stdout)
+            self.assertFalse(os.path.exists(old))                           # 超过 24 小时的临时目录被清理
+            self.assertTrue(os.path.exists(new))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

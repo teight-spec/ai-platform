@@ -37,7 +37,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse, RedirectResponse
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 CN_TZ = timezone(timedelta(hours=8))  # 中国不用夏令时，固定 UTC+8
 
 
@@ -70,6 +70,14 @@ MOCK_NOTE = "模拟模式（未连接智谱，费用为估算）"
 CHAT_MAX_YUAN = float(_env("CHAT_MAX_YUAN", "5"))
 # 单次请求的输入上限（估算 tokens）：对话太长或把大表格读进对话时拦下来；0 = 不限
 MAX_INPUT_TOKENS = int(float(_env("MAX_INPUT_TOKENS", "100000")))
+# 工具输出截断：单条工具结果（终端命令输出、读文件）超过这么多字时，只把开头和结尾发给模型（截掉的部分员工在界面上仍能看到）；0 = 不截断
+TOOL_OUTPUT_MAX_CHARS = int(float(_env("TOOL_OUTPUT_MAX_CHARS", "12000")))
+# 长对话提示：本对话上一次输入超过这么多 tokens，或本对话费用超过单对话上限的这个百分比时，提示员工新开对话；0 = 不提示
+CHAT_HINT_TOKENS = int(float(_env("CHAT_HINT_TOKENS", "60000")))
+CHAT_HINT_PCT = float(_env("CHAT_HINT_PCT", "60"))
+# 部门说明篇幅上限（字）与复核周期（天）：和终端里 dept.py 一致，月度价值页据此标黄
+NOTES_MAX_CHARS = int(float(_env("AI_NOTES_MAX_CHARS", "3000")))
+NOTES_REVIEW_DAYS = int(float(_env("NOTES_REVIEW_DAYS", "31")))
 # 月度价值页：部门共享文件夹只读挂载在这里（只统计 02_输出、03_周报、04_技能、05_模板 的目录名和条目数，不读文件内容）
 DEPTS_ROOT = _env("DEPTS_ROOT", "/depts")
 # 一键初始化后的 Open WebUI 配置基线（配置检查用）
@@ -159,6 +167,28 @@ def get_chat_spent(chat_id):
     return float(r["s"])
 
 
+def get_chat_last_input(chat_id):
+    """本对话最近一次成功的主对话调用的输入 tokens（标题生成等后台调用不算）"""
+    if not chat_id:
+        return 0
+    with db() as c:
+        r = c.execute("SELECT prompt_tokens FROM calls WHERE chat_id=? AND task='chat' AND status=200 "
+                      "ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
+    return int(r["prompt_tokens"] or 0) if r else 0
+
+
+def chat_hint(chat_spent, last_input):
+    """长对话提示：返回提示文字，或空字符串"""
+    why = []
+    if CHAT_HINT_TOKENS and last_input >= CHAT_HINT_TOKENS:
+        why.append(f"上一轮输入约 {last_input / 10000:.1f} 万 tokens")
+    if CHAT_MAX_YUAN > 0 and CHAT_HINT_PCT and chat_spent >= CHAT_MAX_YUAN * CHAT_HINT_PCT / 100:
+        why.append(f"已用 ¥{chat_spent:.2f}（上限 ¥{CHAT_MAX_YUAN:g}）")
+    if not why:
+        return ""
+    return "这个对话已经比较长（" + "，".join(why) + "），每轮都更费钱。建议做完这一步就点「新对话」：已确认的口径在部门说明里，文件都在部门文件夹，不会丢。"
+
+
 def spend_info(dept, month=None):
     month = month or month_of()
     spent, limit = get_spent(dept, month), get_limit(dept)
@@ -245,6 +275,39 @@ def upstream_headers():
     return {"Authorization": f"Bearer {UPSTREAM_KEY}", "Content-Type": "application/json"}
 
 
+TRUNC_NOTE = ("……【费用闸门：这段工具输出共 {n} 字，太长，中间 {cut} 字没有发给模型（界面上仍能看到全文）。"
+              "需要细节时：把结果写进文件，再用 head / grep / peek.py 只看需要的部分】……")
+
+
+def _cut(text):
+    if len(text) <= TOOL_OUTPUT_MAX_CHARS or "【费用闸门：这段工具输出共" in text:
+        return text, False
+    head = int(TOOL_OUTPUT_MAX_CHARS * 0.6)
+    tail = TOOL_OUTPUT_MAX_CHARS - head
+    return text[:head] + "\n" + TRUNC_NOTE.format(n=len(text), cut=len(text) - head - tail) + "\n" + text[-tail:], True
+
+
+def truncate_tool_outputs(body):
+    """把过长的工具结果（role=tool）截成「开头 60% + 结尾 40%」。规则固定，同一条历史每次截得一样，不影响缓存命中。
+    返回截断的条数。"""
+    if not TOOL_OUTPUT_MAX_CHARS:
+        return 0
+    n = 0
+    for m in body.get("messages") or []:
+        if not isinstance(m, dict) or m.get("role") != "tool":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            m["content"], hit = _cut(c)
+            n += hit
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    part["text"], hit = _cut(part["text"])
+                    n += hit
+    return n
+
+
 def check_limits(dept, meta, prompt_chars):
     """单对话费用上限 + 单次输入上限。返回 None=放行，或 (状态码, 类型, 提示)"""
     if MAX_INPUT_TOKENS and est_tokens(prompt_chars) > MAX_INPUT_TOKENS:
@@ -298,9 +361,12 @@ def mock_reply(body, task):
     names = [f["name"] for f in tools]
     if last.get("role") == "tool":
         out = _text_of(last.get("content"))
-        return (f"【模拟回复】工具已执行，返回 {len(out)} 字，前 800 字如下：\n\n```\n{out[:800]}\n```\n\n"
+        cut = "（发给模型前已被费用闸门截断）" if "【费用闸门：这段工具输出共" in out else ""
+        return (f"【模拟回复】工具已执行，返回 {len(out)} 字{cut}，前 800 字如下：\n\n```\n{out[:800]}\n```\n\n"
                 f"（链路正常：模型 → 工具 → 结果回传。）"), "模拟思考：读取工具结果。", None
     text = _text_of(last.get("content")).strip()
+    nudged = "（平台提示，不用单独回复" in text
+    text = text.split("\n\n（平台提示，不用单独回复")[0].strip()  # 过滤器加的长对话收尾提示，不影响模拟命令
     if text.startswith("#工具"):
         if not tools:
             return "【模拟回复】本次请求没有带任何工具。请确认对话里已选择部门终端（或部门助手已绑定终端）。", "", None
@@ -324,7 +390,8 @@ def mock_reply(body, task):
         call = {"id": "call_mock_" + str(int(time.time() * 1000)), "type": "function",
                 "function": {"name": name, "arguments": args}}
         return "", f"模拟思考：按指令调用工具 {name}。", [call]
-    return (f"【模拟回复 · 未连接智谱】收到你的消息（{len(text)} 字）。\n\n"
+    nudge = "\n- 消息末尾带有长对话收尾提示（过滤器已生效）" if nudged else ""
+    return (f"【模拟回复 · 未连接智谱】收到你的消息（{len(text)} 字）。{nudge}\n\n"
             f"- 模型：{body.get('model', '')}\n- 本次消息条数：{len(msgs)}\n"
             f"- 可用工具：{len(names)} 个{('（' + '、'.join(names[:8]) + '）') if names else ''}\n\n"
             "测试命令：发送 `#工具` 查看可用工具；发送 `#调用 工具名 {\"参数\": \"值\"}` 让模拟模型调用工具。"), \
@@ -335,7 +402,7 @@ def _chunks(text, size=8):
     return [text[i:i + size] for i in range(0, len(text), size)] if text else []
 
 
-async def mock_chat(body, dept, model, stream, meta, t0):
+async def mock_chat(body, dept, model, stream, meta, t0, cut_note=""):
     content, reasoning, tool_calls = mock_reply(body, meta.get("task", "chat"))
     prompt_chars = len(json.dumps(body.get("messages", []), ensure_ascii=False)) + \
         len(json.dumps(body.get("tools", []), ensure_ascii=False))
@@ -347,6 +414,7 @@ async def mock_chat(body, dept, model, stream, meta, t0):
     cid, created = f"mock-{int(time.time() * 1000)}", int(time.time())
 
     def log(note=MOCK_NOTE):
+        note = "；".join(x for x in (note, cut_note) if x)
         log_call(dept=dept, endpoint="chat", model=model, stream=int(stream), prompt_tokens=p, completion_tokens=c,
                  cached_tokens=0, cost=calc_cost(p, c, 0), estimated=1, status=200,
                  latency_ms=int((time.monotonic() - t0) * 1000), note=note, **meta)
@@ -450,6 +518,8 @@ async def chat_completions(request: Request):
     stream = bool(body.get("stream"))
     model = str(body.get("model", ""))
     meta = who(request)
+    n_cut = truncate_tool_outputs(body)
+    cut_note = f"截断工具输出 {n_cut} 处" if n_cut else ""
     prompt_chars = len(json.dumps(body.get("messages", []), ensure_ascii=False)) + \
         len(json.dumps(body.get("tools", []), ensure_ascii=False))
     t0 = time.monotonic()
@@ -461,7 +531,7 @@ async def chat_completions(request: Request):
                  latency_ms=0, note=message[:120], **meta)
         return err(status, message, typ)
     if MOCK:
-        return await mock_chat(body, dept, model, stream, meta, t0)
+        return await mock_chat(body, dept, model, stream, meta, t0, cut_note)
     url = f"{UPSTREAM_BASE}/chat/completions"
 
     try:
@@ -494,6 +564,8 @@ async def chat_completions(request: Request):
                 p, c = est_tokens(prompt_chars), est_tokens(out_chars)
         elif resp.status_code != 200:
             note = raw[:300].decode("utf-8", "replace")
+        if resp.status_code == 200:
+            note = "；".join(x for x in (note, cut_note) if x)
         cost = calc_cost(p, c, cached) if resp.status_code == 200 else 0.0
         log_call(dept=dept, endpoint="chat", model=model, stream=int(stream), prompt_tokens=p,
                  completion_tokens=c, cached_tokens=cached, cost=cost, estimated=estimated,
@@ -554,6 +626,7 @@ async def chat_completions(request: Request):
                 p, c, cached = est_tokens(prompt_chars), est_tokens(state["out_chars"]), 0
                 estimated = 1
                 note = note or "上游未返回 usage，按字符估算"
+            note = "；".join(x for x in (note, cut_note) if x)
             try:
                 log_call(dept=dept, endpoint="chat", model=model, stream=1, prompt_tokens=p,
                          completion_tokens=c, cached_tokens=cached, cost=calc_cost(p, c, cached),
@@ -610,6 +683,8 @@ async def api_spend(dept: str, chat_id: str = ""):
     info = spend_info(dept)
     if chat_id:
         info["chat_spent"] = round(get_chat_spent(chat_id), 4)
+        info["chat_last_input"] = get_chat_last_input(chat_id)
+        info["chat_hint"] = chat_hint(info["chat_spent"], info["chat_last_input"])
     info["chat_limit"] = CHAT_MAX_YUAN
     return info
 
@@ -719,8 +794,10 @@ async def selfcheck():
         ("部门密钥", bool(DEPTS), f"已配置 {len(DEPTS)} 个：" + "、".join(d["name"] for d in DEPTS.values()), ""),
         ("费用数据库", db_ok, "可读写" if db_ok else f"异常：{last_ok}", "" if db_ok else "检查 /data 挂载目录权限。"),
         ("用量保护", True, (f"单个对话上限 ¥{CHAT_MAX_YUAN:g}" if CHAT_MAX_YUAN else "单个对话不限") + "；" +
-         (f"单次输入上限 {MAX_INPUT_TOKENS / 10000:g} 万 tokens" if MAX_INPUT_TOKENS else "单次输入不限"),
-         "在 .env 里用 CHAT_MAX_YUAN、MAX_INPUT_TOKENS 调整"),
+         (f"单次输入上限 {MAX_INPUT_TOKENS / 10000:g} 万 tokens" if MAX_INPUT_TOKENS else "单次输入不限") + "；" +
+         (f"工具输出超过 {TOOL_OUTPUT_MAX_CHARS} 字截断" if TOOL_OUTPUT_MAX_CHARS else "工具输出不截断") + "；" +
+         (f"长对话提示：输入 ≥ {CHAT_HINT_TOKENS / 10000:g} 万 tokens 或费用 ≥ {CHAT_HINT_PCT:g}%" if (CHAT_HINT_TOKENS or CHAT_HINT_PCT) else "不做长对话提示"),
+         "在 .env 里用 CHAT_MAX_YUAN、MAX_INPUT_TOKENS、TOOL_OUTPUT_MAX_CHARS、CHAT_HINT_TOKENS、CHAT_HINT_PCT 调整"),
         ("管理员密码", bool(ADMIN_PASSWORD), "已设置" if ADMIN_PASSWORD else "未设置（管理页无法登录）",
          "" if ADMIN_PASSWORD else "在 .env 里填写 GATE_ADMIN_PASSWORD。"),
     ] + init_items
@@ -926,7 +1003,8 @@ def _dir_month(path, name):
 def dept_assets(code):
     """扫部门文件夹（只看目录名、条目数）：{mounted, outputs:{月份:个数}, recipes, notes, weekly_set}"""
     root = os.path.join(DEPTS_ROOT, dept_folder(code))
-    info = {"mounted": os.path.isdir(root), "outputs": {}, "recipes": 0, "notes": 0, "weekly_set": False}
+    info = {"mounted": os.path.isdir(root), "outputs": {}, "recipes": 0, "notes": 0, "notes_chars": 0,
+            "notes_review": None, "weekly_set": False}
     if not info["mounted"]:
         return info
     for sub in ("02_输出", "03_周报"):
@@ -949,11 +1027,34 @@ def dept_assets(code):
         pass
     try:
         with open(os.path.join(root, "05_模板", "部门说明.md"), encoding="utf-8") as f:
-            info["notes"] = sum(1 for ln in f if ln.lstrip().startswith("- "))
+            text = f.read()
+        items = [ln.strip() for ln in text.splitlines() if ln.lstrip().startswith("- ")]
+        info["notes"], info["notes_chars"] = len(items), sum(len(x) for x in items)
+        m = re.search(r"^<!-- 最近复核：(\d{4}-\d{2}-\d{2})", text, re.M)
+        info["notes_review"] = m.group(1) if m else None
     except OSError:
         pass
     info["weekly_set"] = os.path.isfile(os.path.join(root, "05_模板", "周报说明.md"))
     return info
+
+
+def notes_status(a):
+    """月度价值页「部门说明」一格：(显示文字, 是否标黄)"""
+    if not a["mounted"]:
+        return "—", False
+    if not a["notes"]:
+        return "<span class='muted'>还没有</span>", False
+    days = None
+    if a["notes_review"]:
+        try:
+            days = (now_cn().date() - datetime.strptime(a["notes_review"], "%Y-%m-%d").date()).days
+        except ValueError:
+            pass
+    full = a["notes_chars"] > NOTES_MAX_CHARS * 0.8
+    stale = a["notes"] >= 5 and (days is None or days > NOTES_REVIEW_DAYS)
+    rv = f"{a['notes_review'][5:]} 复核" if a["notes_review"] else "未复核"
+    txt = f"{a['notes']} 条 · {a['notes_chars']}/{NOTES_MAX_CHARS} 字 · {rv}"
+    return txt, (full or stale)
 
 
 def usage_by_dept(months):
@@ -1054,6 +1155,9 @@ async def admin_value(request: Request, month: str = ""):
         T["recipes"] += a["recipes"]
         T["notes"] += a["notes"]
         per_chat = f"¥{r['cost'] / r['chats']:.2f}" if r["chats"] else "—"
+        ns = notes_status(a)
+        if ns[1]:
+            T["notes_warn"] = T.get("notes_warn", 0) + 1
         per_out = f"¥{r['cost'] / o:.2f}" if o else "—"
         o_txt = "<span class='muted'>未挂载</span>" if o is None else f"{o}"
         rows.append(
@@ -1061,7 +1165,7 @@ async def admin_value(request: Request, month: str = ""):
             f"<td class='num'>{r['users']}</td><td class='num'>{r['chats']}</td><td class='num'><b>{o_txt}</b></td>"
             f"<td class='num'>¥{r['cost']:.2f}</td><td class='num'>{per_chat}</td><td class='num'>{per_out}</td>"
             f"<td class='num {'warn' if r['blocked'] else ''}'>{r['blocked']}</td><td class='num {'warn' if r['capped'] else ''}'>{r['capped']}</td>"
-            f"<td class='num'>{a['recipes'] if a['mounted'] else '—'}</td><td class='num'>{a['notes'] if a['mounted'] else '—'}</td>"
+            f"<td class='num'>{a['recipes'] if a['mounted'] else '—'}</td><td class='num {'warn' if ns[1] else ''}'>{ns[0]}</td>"
             f"<td>{('<span class=ok>已设置</span>' if a['weekly_set'] else '<span class=muted>未设置</span>') if a['mounted'] else '—'}</td></tr>")
     per_out_all = f"¥{T['cost'] / T['outs']:.2f}" if T["outs"] else "—"
     labels = [m[2:].replace("-", "/") for m in months6]
@@ -1070,6 +1174,9 @@ async def admin_value(request: Request, month: str = ""):
     mounted = all(a["mounted"] for a in assets.values())
     warn_mount = "" if mounted else ("<div class='card' style='border-left:4px solid #D9822B'>部分部门文件夹没有挂载到费用闸门（docker-compose.yml 里 cost-gate 的 "
                                      "/depts 只读挂载），成果数、配方数显示为「未挂载」。同步新版 docker-compose.yml 后，项目停止 → 构建即可。</div>")
+    if T.get("notes_warn"):
+        warn_mount += (f"<div class='card' style='border-left:4px solid #D9822B'>有 {T['notes_warn']} 个部门的部门说明需要整理或复核（下表标黄）："
+                       "请该部门员工在对话框输入 <b>/部门说明</b>（复核 / 整理部门说明）。部门说明是助手每次任务都读的口径，过长或过时会让结果变差、费用变高。</div>")
     body = f"""{warn_mount}
 <div class="card" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
 <form method="get" style="margin:0">月份 <select name="month" onchange="this.form.submit()">{opts}</select></form>
@@ -1087,7 +1194,7 @@ async def admin_value(request: Request, month: str = ""):
 <div class="card"><h2>{esc(month)} 各部门明细</h2><div class="scroll"><table>
 <tr><th>部门</th><th class="num">活跃人数</th><th class="num">对话数</th><th class="num">完成成果</th><th class="num">费用</th>
 <th class="num">每个对话</th><th class="num">每个成果</th><th class="num">被拦截</th><th class="num">触顶对话</th>
-<th class="num">部门配方</th><th class="num">部门说明条目</th><th>周报说明</th></tr>{''.join(rows)}
+<th class="num">部门配方</th><th class="num">部门说明</th><th>周报说明</th></tr>{''.join(rows)}
 <tr style="font-weight:700;background:#F7F9FC"><td>合计</td><td class="num">{T['users']}</td><td class="num">{T['chats']}</td><td class="num">{T['outs']}</td>
 <td class="num">¥{T['cost']:.2f}</td><td class="num">{f"¥{T['cost'] / T['chats']:.2f}" if T['chats'] else '—'}</td><td class="num">{per_out_all}</td>
 <td class="num">{T['blocked']}</td><td class="num">{T['capped']}</td><td class="num">{T['recipes']}</td><td class="num">{T['notes']}</td><td></td></tr>
@@ -1099,7 +1206,9 @@ async def admin_value(request: Request, month: str = ""):
 <tr><td>每个对话 / 每个成果</td><td>当月费用 ÷ 对话数 / ÷ 完成成果数。成果增加而单价下降 = 平台越用越省</td></tr>
 <tr><td>被拦截</td><td>因部门额度用完、单对话上限（¥{CHAT_MAX_YUAN:g}）或单次输入太长被拦下的请求次数</td></tr>
 <tr><td>触顶对话</td><td>达到单对话上限的对话个数：多的话说明对话拖得太长或任务太大，适合拆分或存成部门配方</td></tr>
-<tr><td>部门配方 / 部门说明条目</td><td>当前累计：04_技能 里带「验收.json」的配方个数；05_模板/部门说明.md 里的条目数（每条都是用户确认过的口径）</td></tr>
+<tr><td>部门配方</td><td>当前累计：04_技能 里带「验收.json」的配方个数</td></tr>
+<tr><td>部门说明</td><td>05_模板/部门说明.md 的条目数（每条都是用户确认过的口径）、字数 / 上限（{NOTES_MAX_CHARS} 字，每次任务都要读，越长越费钱）、最近复核日期。
+<b style="color:#D9822B">标黄</b> = 超过上限的 80%，或 5 条以上且超过 {NOTES_REVIEW_DAYS} 天没复核：请该部门在对话框输入 /部门说明，助手会列出全部条目、指出重复或过时的，确认后记下复核日期</td></tr>
 </table></div>"""
     return page("月度价值", body, admin_link=False)
 

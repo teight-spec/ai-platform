@@ -4,9 +4,10 @@ Open WebUI 一键初始化（由费用闸门管理页调用）
   - 建部门组、部门助手（绑定部门终端 + 系统提示词 + 只对本部门可见）
   - 给部门终端设置访问权限（只本部门可用）
   - 助手的开场建议按钮、模型参数（温度 0.3）
-  - 斜杠快捷指令 /数据处理 /出图 /周报 /周报设置 /专题汇报（总裁办另有 /周报汇总）
+  - 斜杠快捷指令 /数据处理 /出图 /周报 /周报设置 /专题汇报 /部门说明（总裁办另有 /周报汇总）
   - 安装并启用全局过滤器「部门额度显示」
   - 页面顶部横幅（告知对话会被保存、总裁办和管理员可查看）
+  - 平台开关：关掉 Open WebUI 自带的「个人记忆」（口径统一记在部门说明里）、关自助注册和社区分享
   - 初始化完成后保存一份「配置基线」，以后可在管理页检查有没有人在界面上手工改过配置
   - 批量导入账号并加入部门组
 全部操作可重复执行：已存在就更新，不会重复创建。
@@ -44,6 +45,7 @@ SYSTEM_PROMPT = """你是「{assistant}」，服务于公司{dept_name}，主要
 ## 必须遵守
 1. 数字全部用代码计算，不许心算、估算或编造。回复里写明数据来源文件、行数、筛选条件。
 2. 任何 Excel/CSV 先跑 `python3 /opt/company/kit/peek.py <文件>`，不要把整张表读进对话；终端只打印汇总结果（不超过 30 行）。
+   终端限制：单条命令最长 20 分钟（超时自动终止，退出码 143/137）；单次输出超过约 1.2 万字只会给你看开头和结尾。大任务拆成几步，中间结果写文件。
 3. 字段含义不清楚、有多种理解时，先问用户，确认后再算。数据不足以支撑的结论标注「存疑」。
 4. 输出放 ~/{folder}/02_输出/<YYYYMMDD>_<用户名>_<任务简称>/ （周报放 03_周报/<周次>/），计算代码存为同目录 script.py（用 runio 写成可重跑，结论数字写进 结果摘要.json）。临时文件用 `mktemp -d` 建自己的临时目录。
 5. 交付前运行 `python3 /opt/company/stamp_internal.py <输出目录> -r` 加「内部文件，禁止外传」标注。PPT 一律转 PDF（/opt/company/office2pdf.py），只交 PDF。
@@ -72,7 +74,7 @@ EXEC_PROMPT = """你是「{assistant}」，服务于公司总裁办，负责跨�
 2. 汇总各部门周报时，读各部门 03_周报/<周次>/ 里已生成的周报（PDF 用 pdftotext 读，Excel 用 peek.py 看；有 结果摘要.json 优先读它），数字照抄并注明出处，不要重新从原始数据算一遍。
 3. 数字全部用代码计算或照抄各部门周报，不许心算或估算；回复里写明引用了哪个部门的哪个文件。
 4. 不同部门口径不一致时先指出差异再汇总；数据不足以支撑的结论标注「存疑」。
-5. 任何 Excel/CSV 先跑 peek.py，不要把整张表读进对话。
+5. 任何 Excel/CSV 先跑 peek.py，不要把整张表读进对话。单条命令最长 20 分钟（超时自动终止）；单次输出超过约 1.2 万字只会给你看开头和结尾。
 6. 输出放 ~/{folder}/02_输出/<YYYYMMDD>_<任务简称>/，代码存为 script.py（用 runio 写成可重跑）；临时文件用 `mktemp -d`；交付前运行 `python3 /opt/company/stamp_internal.py <输出目录> -r`；PPT 一律转 PDF，只交 PDF。
 7. 汇报材料先给结论（不超过 3 条，带数字），再给图表。任务结束时新确认的口径建议记入总裁办的部门说明，重复性任务问要不要存成配方。用中文回复，简洁明确。
 
@@ -83,6 +85,18 @@ EXEC_PROMPT = """你是「{assistant}」，服务于公司总裁办，负责跨�
 BANNER_TEXT = ("本平台的对话和文件会保存在公司服务器上，总裁办和平台管理员可以查看全部对话。"
                "请不要发送身份证号、银行卡号等个人隐私。产出文件在本部门共享文件夹里。")
 BANNER_ID = "ai-platform-notice-v1"   # 改了横幅内容时把 v1 改成 v2，已关闭横幅的人会重新看到一次
+
+# 平台开关（管理员设置 → 通用）：一键初始化时强制成这些值，配置检查也会盯着
+#   个人记忆关掉的原因：① 口径要记在部门文件夹的「部门说明」里，全部门共用、可复核，不能散在个人账号上；
+#   ② 个人记忆会插进提示词，每人不同，破坏缓存、增加费用；③ 总裁办和管理员没法统一查看和纠正。
+PLATFORM_SWITCHES = {"ENABLE_MEMORIES": False, "ENABLE_MEMORY_SYSTEM_CONTEXT": False,
+                     "ENABLE_SIGNUP": False, "ENABLE_COMMUNITY_SHARING": False}
+# 员工默认权限里要关掉的功能（features.xxx）
+FEATURES_OFF = ["memories"]
+FEATURE_NAMES = {"memories": "个人记忆"}
+# 配置检查要盯的平台开关（管理员设置 → 通用 里的项目）
+WATCH_SWITCHES = ["ENABLE_SIGNUP", "DEFAULT_USER_ROLE", "ENABLE_COMMUNITY_SHARING", "ENABLE_MEMORIES",
+                  "ENABLE_MEMORY_SYSTEM_CONTEXT", "ENABLE_API_KEYS", "ENABLE_AUTOMATIONS", "ENABLE_CHANNELS", "ENABLE_NOTES"]
 
 # 模型参数：数据类工作要稳定，温度调低
 MODEL_PARAMS = {"temperature": 0.3}
@@ -117,6 +131,9 @@ QUICK_COMMANDS = [
      "content": "本部门第一次用 AI 做周报。往期周报样本我放在 05_模板 里了（文件：【文件名】），请按「公司-周报PPT」技能的情况 A 先了解我们现在的周报怎么做，逐项和我确认后写成周报说明。"},
     {"command": "专题汇报", "name": "专题汇报 PPT（PDF）", "scope": "all",
      "content": "请把【主题/数据文件】做成汇报 PPT，约【页数】页，汇报对象【谁】。先给我提纲确认，再出 PPT，只交 PDF。"},
+    {"command": "部门说明", "name": "复核 / 整理部门说明", "scope": "all",
+     "content": "请帮我复核本部门的部门说明：运行 dept.py note-list 列出全部条目，按小节给我看，指出可能重复、过时或互相矛盾的条目，"
+                "并建议怎么合并或删除。等我逐条确认后再改（note --replace / note-del），最后用 note-review 记录复核。"},
     {"command": "周报汇总", "name": "汇总各部门本周周报", "scope": "exec",
      "content": "请读取各部门 03_周报 里最新一周（周次：【不填按最新】）的周报，汇总成总览：每个部门 3 条要点 + 关键数字对比图，注明出处，只交 PDF。"},
 ]
@@ -305,12 +322,47 @@ class Setup:
         if not fn.get("is_global"):
             await self.req("POST", f"/api/v1/functions/id/{FILTER_ID}/toggle/global")
         await self.req("POST", f"/api/v1/functions/id/{FILTER_ID}/valves/update",
-                       json={"gate_url": gate_internal_url, "dept_codes": ",".join(all_codes), "priority": 0})
+                       json={"gate_url": gate_internal_url, "dept_codes": ",".join(all_codes), "priority": 0,
+                             "long_chat_hint": True})
         fn = await self.req("GET", f"/api/v1/functions/id/{FILTER_ID}")
         if fn.get("is_active") and fn.get("is_global"):
             self.ok("过滤器「部门额度显示」已安装，状态：启用 + 全局")
         else:
             self.bad(f"过滤器状态异常：启用={fn.get('is_active')} 全局={fn.get('is_global')}")
+
+    async def ensure_switches(self, gids):
+        """平台开关 + 员工默认权限 + 部门组权限：关掉个人记忆等（可重复执行）"""
+        cfg = await self.req("GET", "/api/v1/auths/admin/config") or {}
+        diff = {k: v for k, v in PLATFORM_SWITCHES.items() if cfg.get(k) != v}
+        if diff:
+            cfg.update(PLATFORM_SWITCHES)
+            await self.req("POST", "/api/v1/auths/admin/config", json=cfg)
+        cfg = await self.req("GET", "/api/v1/auths/admin/config") or {}
+        wrong = [k for k, v in PLATFORM_SWITCHES.items() if cfg.get(k) != v]
+        if wrong:
+            self.bad(f"平台开关没设上：{'、'.join(wrong)}（请到 管理员设置 → 通用 手工关闭）")
+        else:
+            self.ok("平台开关：个人记忆已关闭（口径统一记在部门说明）、自助注册和社区分享已关闭"
+                    + ("" if diff else "（原来就是这样）"))
+        perms = await self.req("GET", "/api/v1/users/default/permissions") or {}
+        feats = perms.setdefault("features", {})
+        if any(feats.get(f) is not False for f in FEATURES_OFF):
+            for f in FEATURES_OFF:
+                feats[f] = False
+            await self.req("POST", "/api/v1/users/default/permissions", json=perms)
+        self.ok("员工默认权限：已关闭「" + "、".join(FEATURE_NAMES.get(f, f) for f in FEATURES_OFF) + "」")
+        # 部门组权限：组里单独开了的也要关（组权限和默认权限是「任一开启即开启」）
+        for g in await self.req("GET", "/api/v1/groups/") or []:
+            if g.get("id") not in gids.values():
+                continue
+            gp = g.get("permissions") or {}
+            if any((gp.get("features") or {}).get(f) for f in FEATURES_OFF):
+                gp.setdefault("features", {})
+                for f in FEATURES_OFF:
+                    gp["features"][f] = False
+                await self.req("POST", f"/api/v1/groups/id/{g['id']}/update",
+                               json={"name": g["name"], "description": g.get("description", ""), "permissions": gp})
+                self.ok(f"部门组「{g['name']}」单独开了个人记忆，已关闭")
 
     async def ensure_banner(self):
         """页面顶部横幅：告知员工对话会保存、可被查看。BANNER_TEXT 为空 = 去掉本平台的横幅（别的横幅不动）"""
@@ -333,7 +385,8 @@ class Setup:
             return sorted(f"{gname.get(g.get('principal_id'), g.get('principal_type', '') + ':' + str(g.get('principal_id')))}"
                           f"·{g.get('permission')}" for g in (gs or []))
 
-        snap = {"部门组": {}, "助手与模型": {}, "快捷指令": {}, "过滤器": {}, "终端连接": {}, "横幅": [], "默认权限": {}}
+        snap = {"部门组": {}, "助手与模型": {}, "快捷指令": {}, "过滤器": {}, "终端连接": {}, "横幅": [], "默认权限": {},
+                "平台开关": {}}
         for g in groups:
             snap["部门组"][g["name"]] = {"说明": g.get("description", ""), "权限": g.get("permissions") or {}}
         for m in await self.req("GET", "/api/v1/models/export") or []:
@@ -368,6 +421,11 @@ class Setup:
             snap["默认权限"] = await self.req("GET", "/api/v1/users/default/permissions") or {}
         except Exception as e:
             snap["默认权限"] = {"读取失败": str(e)[:80]}
+        try:
+            cfg = await self.req("GET", "/api/v1/auths/admin/config") or {}
+            snap["平台开关"] = {k: cfg.get(k) for k in WATCH_SWITCHES}
+        except Exception as e:
+            snap["平台开关"] = {"读取失败": str(e)[:80]}
         return snap
 
     async def save_baseline(self, folder):
@@ -402,6 +460,7 @@ class Setup:
             await self.ensure_models(gids)
             await self.ensure_prompts(gids)
             await self.ensure_filter(gate_internal_url, all_codes)
+            await self.ensure_switches(gids)
             await self.ensure_banner()
             if baseline_dir:
                 await self.save_baseline(baseline_dir)
