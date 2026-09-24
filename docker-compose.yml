@@ -48,7 +48,7 @@ services:
       - ${NAS_VOLUME}/AI营销:/depts/营销
       - ${NAS_VOLUME}/AI总裁办:/depts/总裁办
 
-  # ---- 2. 费用闸门（唯一出网点：按部门计价、限额、自检页、管理页）------------
+  # ---- 2. 费用闸门（唯一出网点：按部门计价、限额、自检页、管理页、月度价值页）--
   cost-gate:
     image: ${IMAGE_OPENWEBUI}          # 复用 Open WebUI 镜像里的 Python，不用另外构建
     container_name: ai-cost-gate
@@ -78,10 +78,16 @@ services:
       OWUI_URL: http://open-webui:8080
       GATE_INTERNAL_URL: http://cost-gate:8000
       INIT_REPORT: /init-report/init_report.json
+      DEPTS_ROOT: /depts
     volumes:
       - ./cost-gate:/gate:ro
       - ./data/cost-gate:/data
       - ./data/init:/init-report:ro
+      # 月度价值页：部门文件夹只读挂载，只统计 02_输出/03_周报 的文件夹个数、04_技能 的配方数、部门说明条目数，不读文件内容
+      - ${NAS_VOLUME}/AI资材:/depts/资材:ro
+      - ${NAS_VOLUME}/AI财务:/depts/财务:ro
+      - ${NAS_VOLUME}/AI营销:/depts/营销:ro
+      - ${NAS_VOLUME}/AI总裁办:/depts/总裁办:ro
     mem_limit: 384m
     cpu_shares: 512
     healthcheck:

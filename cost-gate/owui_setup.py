@@ -6,54 +6,83 @@ Open WebUI 一键初始化（由费用闸门管理页调用）
   - 助手的开场建议按钮、模型参数（温度 0.3）
   - 斜杠快捷指令 /数据处理 /出图 /周报 /周报设置 /专题汇报（总裁办另有 /周报汇总）
   - 安装并启用全局过滤器「部门额度显示」
+  - 页面顶部横幅（告知对话会被保存、总裁办和管理员可查看）
+  - 初始化完成后保存一份「配置基线」，以后可在管理页检查有没有人在界面上手工改过配置
   - 批量导入账号并加入部门组
 全部操作可重复执行：已存在就更新，不会重复创建。
 """
+import hashlib
+import json
 import os
+import time
+from datetime import datetime
+
 import httpx
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE_MODEL = os.getenv("GATE_MODELS", "glm-5.3-flash").split(",")[0].strip()
 FILTER_ID = "dept_budget"
 
-SYSTEM_PROMPT = """你是「{assistant}」，服务于公司{dept_name}，主要做三件事：数据处理、出图表、收集数据生成周报汇报 PPT。当前用户：{{{{USER_NAME}}}}，今天：{{{{CURRENT_DATE}}}}。
+# 提示词的写法：固定内容在前、每次都变的内容（用户名、日期）放在最后。
+# 上下文缓存一般按「开头相同的部分」命中（命中部分单价不到正常输入的 1/3，见 .env 的 PRICE_CACHED）；
+# 变量放在开头，每人每天的开头都不一样，缓存就很难命中。效果看管理页「最近 50 次调用」的「缓存命中」列。
+SYSTEM_PROMPT = """你是「{assistant}」，服务于公司{dept_name}，主要做三件事：数据处理、出图表、收集数据生成周报汇报 PPT。
 
 ## 工作环境
 - 你可以使用终端（Linux + Python + Node + LibreOffice），终端没有外网，不能安装任何包。
-- 本部门文件夹 ~/{folder}/ ，只在这里读写：01_原始数据、02_输出、03_周报、04_技能、05_模板。对话里上传的文件会存进 01_原始数据。
-- 公司技能总目录 /opt/company/skills/INDEX.md；公司工具包 /opt/company/kit/（peek.py 看数据、charts 出图、tables 出 Excel、weekly.py 周报管线）。
+- 本部门文件夹 ~/{folder}/ ，只在这里读写：01_原始数据、02_输出、03_周报、04_技能（部门技能和配方）、05_模板（部门说明、周报说明、往期样本）。对话里上传的文件会存进 01_原始数据。
+- 公司技能总目录 /opt/company/skills/INDEX.md；公司工具包 /opt/company/kit/（dept.py 部门说明与配方、peek.py 看数据、charts 出图、tables 出 Excel、runio 可重跑脚本）。
 
-## 按任务先读技能（部门 04_技能 里有同类技能时以部门的为准）
-- 数据处理 / 出图 / 汇总表 → /opt/company/skills/公司-数据处理与出图/SKILL.md
-- 周报 → /opt/company/skills/公司-周报PPT/SKILL.md（先按部门的 05_模板/周报说明.md 做；还没有就先了解部门现在怎么做周报，不要套用固定格式）
-- 其他 Excel/Word/PPT/PDF 操作 → 先读 INDEX.md
+## 每个任务先做
+- 先运行 `python3 /opt/company/kit/dept.py start`：部门说明里已确认的口径直接照用，不再重复问；有同类部门配方就用配方重跑。
+- 再按任务读技能（部门 04_技能 里有同类技能时以部门的为准）：
+  - 数据处理 / 出图 / 汇总表 → /opt/company/skills/公司-数据处理与出图/SKILL.md
+  - 周报 → /opt/company/skills/公司-周报PPT/SKILL.md（先按部门的 05_模板/周报说明.md 做；还没有就先了解部门现在怎么做周报，不要套用固定格式）
+  - 记口径、存配方、用配方 → /opt/company/skills/公司-部门说明与配方/SKILL.md
+  - 其他 Excel/Word/PPT/PDF 操作 → 先读 INDEX.md
 
 ## 必须遵守
 1. 数字全部用代码计算，不许心算、估算或编造。回复里写明数据来源文件、行数、筛选条件。
 2. 任何 Excel/CSV 先跑 `python3 /opt/company/kit/peek.py <文件>`，不要把整张表读进对话；终端只打印汇总结果（不超过 30 行）。
 3. 字段含义不清楚、有多种理解时，先问用户，确认后再算。数据不足以支撑的结论标注「存疑」。
-4. 输出放 ~/{folder}/02_输出/<YYYYMMDD>_<用户名>_<任务简称>/ （周报放 03_周报/<周次>/），计算代码存为同目录 script.py。
+4. 输出放 ~/{folder}/02_输出/<YYYYMMDD>_<用户名>_<任务简称>/ （周报放 03_周报/<周次>/），计算代码存为同目录 script.py（用 runio 写成可重跑，结论数字写进 结果摘要.json）。临时文件用 `mktemp -d` 建自己的临时目录。
 5. 交付前运行 `python3 /opt/company/stamp_internal.py <输出目录> -r` 加「内部文件，禁止外传」标注。PPT 一律转 PDF（/opt/company/office2pdf.py），只交 PDF。
 6. 报表是给领导看的：先给结论（不超过 3 条，带数字），再给图表，明细放附件。
-7. 用中文回复，简洁明确。"""
+7. 任务结束时：本次新确认的口径列成「建议记入部门说明」，用户同意后用 dept.py note 写入；以后还会重复的任务，问用户要不要存成部门配方。
+8. 用中文回复，简洁明确。
+
+## 本次对话
+- 当前用户：{{{{USER_NAME}}}}；今天：{{{{CURRENT_DATE}}}}"""
 
 
-EXEC_PROMPT = """你是「{assistant}」，服务于公司总裁办，负责跨部门的数据汇总、出图和汇报材料。当前用户：{{{{USER_NAME}}}}，今天：{{{{CURRENT_DATE}}}}。
+EXEC_PROMPT = """你是「{assistant}」，服务于公司总裁办，负责跨部门的数据汇总、出图和汇报材料。
 
 ## 工作环境
 - 你可以使用终端（Linux + Python + Node + LibreOffice），终端没有外网，不能安装任何包。
-- 各部门文件夹（只读）：{readonly_dirs}。每个部门下有 01_原始数据、02_输出、03_周报（每周一个 <周次> 子文件夹）、04_技能、05_模板（部门的周报说明.md 在这里）。
+- 各部门文件夹（只读）：{readonly_dirs}。每个部门下有 01_原始数据、02_输出、03_周报（每周一个 <周次> 子文件夹）、04_技能、05_模板（部门说明.md、周报说明.md 在这里）。
 - 总裁办自己的文件夹（可写）：~/{folder}/ ，所有产出都放这里。
-- 公司技能总目录 /opt/company/skills/INDEX.md；公司工具包 /opt/company/kit/（peek.py、charts、tables）。
+- 公司技能总目录 /opt/company/skills/INDEX.md；公司工具包 /opt/company/kit/（dept.py、peek.py、charts、tables、runio）。
+
+## 每个任务先做
+- 先运行 `python3 /opt/company/kit/dept.py start`（总裁办自己的部门说明和配方）。
+- 用到某个部门的数据时，先读该部门的 05_模板/部门说明.md：那个部门的术语和口径以它为准。
 
 ## 必须遵守
 1. 各部门文件夹只读，不要尝试修改、移动或删除里面的文件。
-2. 汇总各部门周报时，读各部门 03_周报/<周次>/ 里已生成的周报（PDF 用 pdftotext 读，Excel 用 peek.py 看），数字照抄并注明出处，不要重新从原始数据算一遍。
+2. 汇总各部门周报时，读各部门 03_周报/<周次>/ 里已生成的周报（PDF 用 pdftotext 读，Excel 用 peek.py 看；有 结果摘要.json 优先读它），数字照抄并注明出处，不要重新从原始数据算一遍。
 3. 数字全部用代码计算或照抄各部门周报，不许心算或估算；回复里写明引用了哪个部门的哪个文件。
 4. 不同部门口径不一致时先指出差异再汇总；数据不足以支撑的结论标注「存疑」。
 5. 任何 Excel/CSV 先跑 peek.py，不要把整张表读进对话。
-6. 输出放 ~/{folder}/02_输出/<YYYYMMDD>_<任务简称>/，代码存为 script.py；交付前运行 `python3 /opt/company/stamp_internal.py <输出目录> -r`；PPT 一律转 PDF，只交 PDF。
-7. 汇报材料先给结论（不超过 3 条，带数字），再给图表。用中文回复，简洁明确。"""
+6. 输出放 ~/{folder}/02_输出/<YYYYMMDD>_<任务简称>/，代码存为 script.py（用 runio 写成可重跑）；临时文件用 `mktemp -d`；交付前运行 `python3 /opt/company/stamp_internal.py <输出目录> -r`；PPT 一律转 PDF，只交 PDF。
+7. 汇报材料先给结论（不超过 3 条，带数字），再给图表。任务结束时新确认的口径建议记入总裁办的部门说明，重复性任务问要不要存成配方。用中文回复，简洁明确。
+
+## 本次对话
+- 当前用户：{{{{USER_NAME}}}}；今天：{{{{CURRENT_DATE}}}}"""
+
+# 页面顶部横幅（所有人可见，可关闭）：告知对话会被保存和查看；内容为空字符串 = 不显示横幅
+BANNER_TEXT = ("本平台的对话和文件会保存在公司服务器上，总裁办和平台管理员可以查看全部对话。"
+               "请不要发送身份证号、银行卡号等个人隐私。产出文件在本部门共享文件夹里。")
+BANNER_ID = "ai-platform-notice-v1"   # 改了横幅内容时把 v1 改成 v2，已关闭横幅的人会重新看到一次
 
 # 模型参数：数据类工作要稳定，温度调低
 MODEL_PARAMS = {"temperature": 0.3}
@@ -91,6 +120,30 @@ QUICK_COMMANDS = [
     {"command": "周报汇总", "name": "汇总各部门本周周报", "scope": "exec",
      "content": "请读取各部门 03_周报 里最新一周（周次：【不填按最新】）的周报，汇总成总览：每个部门 3 条要点 + 关键数字对比图，注明出处，只交 PDF。"},
 ]
+
+
+def _short(v, n=60):
+    t = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+    t = t.replace("\n", "⏎")
+    return t if len(t) <= n else t[: n - 1] + "…"
+
+
+def _diff(a, b, path, out):
+    """递归比较两份快照，结果追加到 out：(位置, 基线值, 现在值)；基线值/现在值为 None 表示新增/删除"""
+    if isinstance(a, dict) and isinstance(b, dict):
+        for k in sorted(set(a) | set(b)):
+            p = f"{path} › {k}" if path else k
+            if k not in b:
+                out.append((p, _short(a[k]), None))
+            elif k not in a:
+                out.append((p, None, _short(b[k])))
+            else:
+                _diff(a[k], b[k], p, out)
+    elif a != b:
+        if isinstance(a, str) and isinstance(b, str) and (len(a) > 60 or len(b) > 60):
+            out.append((path, f"（{len(a)} 字）{_short(a, 40)}", f"（{len(b)} 字）{_short(b, 40)}"))
+        else:
+            out.append((path, _short(a), _short(b)))
 
 
 class Setup:
@@ -259,7 +312,88 @@ class Setup:
         else:
             self.bad(f"过滤器状态异常：启用={fn.get('is_active')} 全局={fn.get('is_global')}")
 
-    async def run_all(self, gate_internal_url, all_codes):
+    async def ensure_banner(self):
+        """页面顶部横幅：告知员工对话会保存、可被查看。BANNER_TEXT 为空 = 去掉本平台的横幅（别的横幅不动）"""
+        cur = await self.req("GET", "/api/v1/configs/banners") or []
+        keep = [b for b in cur if not str(b.get("id", "")).startswith("ai-platform-notice")]
+        if BANNER_TEXT:
+            old = next((b for b in cur if b.get("id") == BANNER_ID), None)
+            keep.append({"id": BANNER_ID, "type": "info", "title": "", "content": BANNER_TEXT, "dismissible": True,
+                         "timestamp": (old or {}).get("timestamp") or int(time.time())})
+        await self.req("POST", "/api/v1/configs/banners", json={"banners": keep})
+        self.ok("页面顶部横幅已设置：" + BANNER_TEXT if BANNER_TEXT else "已去掉本平台的页面横幅")
+
+    # ------------------------------------------------------------ 配置快照（检查有没有人在界面上手工改过）
+    async def snapshot(self):
+        """把和本平台有关的 Open WebUI 配置整理成一份可比较的 JSON（去掉时间戳、密钥、成员名单这类会正常变化的内容）"""
+        groups = await self.req("GET", "/api/v1/groups/") or []
+        gname = {g["id"]: g["name"] for g in groups}
+
+        def grants(gs):
+            return sorted(f"{gname.get(g.get('principal_id'), g.get('principal_type', '') + ':' + str(g.get('principal_id')))}"
+                          f"·{g.get('permission')}" for g in (gs or []))
+
+        snap = {"部门组": {}, "助手与模型": {}, "快捷指令": {}, "过滤器": {}, "终端连接": {}, "横幅": [], "默认权限": {}}
+        for g in groups:
+            snap["部门组"][g["name"]] = {"说明": g.get("description", ""), "权限": g.get("permissions") or {}}
+        for m in await self.req("GET", "/api/v1/models/export") or []:
+            meta = dict(m.get("meta") or {})
+            meta.pop("profile_image_url", None)
+            snap["助手与模型"][m["id"]] = {"名称": m.get("name"), "底层模型": m.get("base_model_id"),
+                                          "启用": m.get("is_active"), "参数": m.get("params") or {}, "设置": meta,
+                                          "可见范围": grants(m.get("access_grants"))}
+        for p in await self.req("GET", "/api/v1/prompts/") or []:
+            snap["快捷指令"]["/" + (p.get("command") or "").lstrip("/")] = {
+                "名称": p.get("name"), "内容": p.get("content"), "可见范围": grants(p.get("access_grants")),
+                "启用": p.get("is_active", True)}
+        for f in await self.req("GET", "/api/v1/functions/") or []:
+            full = await self.req("GET", f"/api/v1/functions/id/{f['id']}") or {}
+            try:
+                valves = await self.req("GET", f"/api/v1/functions/id/{f['id']}/valves") or {}
+            except Exception:
+                valves = {}
+            snap["过滤器"][f["id"]] = {"名称": f.get("name"), "启用": full.get("is_active"), "全局": full.get("is_global"),
+                                     "设置": valves,
+                                     "代码指纹": hashlib.sha256((full.get("content") or "").encode()).hexdigest()[:16]}
+        cfg = await self.req("GET", "/api/v1/configs/terminal_servers") or {}
+        for c in cfg.get("TERMINAL_SERVER_CONNECTIONS", []):
+            c = {k: v for k, v in c.items() if k not in ("key",)}
+            conf = dict(c.get("config") or {})
+            conf["access_grants"] = grants(conf.get("access_grants"))
+            c["config"] = conf
+            snap["终端连接"][c.get("id") or c.get("url")] = c
+        snap["横幅"] = [{k: b.get(k) for k in ("id", "type", "content", "dismissible")}
+                      for b in (await self.req("GET", "/api/v1/configs/banners") or [])]
+        try:
+            snap["默认权限"] = await self.req("GET", "/api/v1/users/default/permissions") or {}
+        except Exception as e:
+            snap["默认权限"] = {"读取失败": str(e)[:80]}
+        return snap
+
+    async def save_baseline(self, folder):
+        snap = await self.snapshot()
+        os.makedirs(folder, exist_ok=True)
+        doc = {"_说明": "一键初始化后的 Open WebUI 配置基线",
+               "_时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "配置": snap}
+        with open(os.path.join(folder, "基线.json"), "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(folder, f"基线_{datetime.now():%Y%m%d_%H%M%S}.json"), "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False, indent=2)
+        self.ok(f"已保存配置基线（{doc['_时间']}）：以后可在管理页「配置检查」发现界面上的手工改动")
+
+    async def check_drift(self, folder):
+        """和基线比较，返回 (基线时间, 差异列表)。差异 = [(位置, 基线值, 现在值)]"""
+        p = os.path.join(folder, "基线.json")
+        if not os.path.isfile(p):
+            raise RuntimeError("还没有配置基线：请先在管理页点一次「一键初始化」")
+        base = json.load(open(p, encoding="utf-8"))
+        await self.signin()
+        now = await self.snapshot()
+        diffs = []
+        _diff(base["配置"], now, "", diffs)
+        return base.get("_时间", ""), diffs
+
+    async def run_all(self, gate_internal_url, all_codes, baseline_dir=None):
         try:
             await self.signin()
             gids = await self.ensure_groups()
@@ -268,6 +402,9 @@ class Setup:
             await self.ensure_models(gids)
             await self.ensure_prompts(gids)
             await self.ensure_filter(gate_internal_url, all_codes)
+            await self.ensure_banner()
+            if baseline_dir:
+                await self.save_baseline(baseline_dir)
             self.ok("初始化完成。下一步：在下方批量导入员工账号。")
         except Exception as e:
             self.bad(str(e))

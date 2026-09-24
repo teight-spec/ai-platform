@@ -7,6 +7,12 @@ description: 处理员工上传的 Excel/CSV：看数据、清洗、汇总、出
 
 公司工具包在 `/opt/company/kit/`，用它能少写代码、格式统一。**不要把整张表读进对话。**
 
+## 第 0 步：看部门说明和配方（必做）
+```bash
+python3 /opt/company/kit/dept.py start
+```
+部门说明里已确认的口径直接照用；有同类配方就用配方（`recipe-run`），见 `/opt/company/skills/公司-部门说明与配方/SKILL.md`。
+
 ## 第 1 步：先看数据（必做）
 ```bash
 python3 /opt/company/kit/peek.py <文件>                 # 所有 sheet 概况
@@ -17,6 +23,15 @@ python3 /opt/company/kit/peek.py <文件> --sheet 明细 --header 3   # 表头�
 
 ## 第 2 步：写 script.py 计算（不要在对话里手算）
 - 输出目录：`~/<部门>/02_输出/<YYYYMMDD>_<用户名>_<任务简称>/`，代码存成同目录 `script.py`，能直接重跑。
+- script.py 开头用 `runio.io_args` 接收输入文件和输出目录，结尾用 `save_summary` 记下结论里的关键数字：
+  ```python
+  import sys; sys.path.insert(0, "/opt/company/kit")
+  from runio import io_args, save_summary
+  inputs, out = io_args(["<本次输入文件>"], "<本次输出目录>")
+  ...
+  save_summary({"入库总金额(元)": total, "有效行数": n})
+  ```
+- 临时文件用 `mktemp -d` 建自己的临时目录，不要用固定文件名。
 - 清洗规则：去全空行；重复行只报告、问过用户再删；日期统一 YYYY-MM-DD；金额/数量转数字，转不了的**列出来**，不要悄悄丢掉；不擅自填补缺失值。
 - 每一步删了/改了多少行，写进 `清洗记录.txt`。
 - 终端输出只打印汇总结果（不超过 30 行），不要打印整张明细表。
@@ -44,6 +59,7 @@ save_excel("汇总.xlsx", {"结论与汇总": 汇总表, "清洗后明细": 明�
 
 ## 第 5 步：交付
 1. `python3 /opt/company/stamp_internal.py <输出目录> -r`
-2. 回复格式：① 结论（不超过 3 条，每条带数字）② 图表文件 ③ 文件清单 ④ 存疑事项（数据不足、字段含义没确认的都写上）。
+2. 回复格式：① 结论（不超过 3 条，每条带数字，和 结果摘要.json 一致）② 图表文件 ③ 文件清单 ④ 存疑事项（数据不足、字段含义没确认的都写上）
+   ⑤ 建议记入部门说明（本次新确认的口径，用户同意后用 `dept.py note` 写入）⑥ 任务以后还会重复时，问一句要不要存成部门配方。
 3. 用户要 PPT 汇报时，读 `/opt/company/skills/pptx-generator/SKILL.md`，按 INDEX 的公司规定做，最后只交 PDF。
    如果是**周报**，改用「公司-周报PPT」技能。

@@ -9,18 +9,21 @@
 |---|---|
 | 整理/清洗数据、汇总统计、出图、出 Excel 汇总表 | `/opt/company/skills/公司-数据处理与出图/SKILL.md` |
 | 周报（先了解部门现在的做法，再照做 → PDF） | `/opt/company/skills/公司-周报PPT/SKILL.md` |
+| 记住口径、存成配方、按上次的做法再做、用部门配方 | `/opt/company/skills/公司-部门说明与配方/SKILL.md` |
 | Excel 的特殊操作：改公式、改格式、在原文件上插行插列、公式检查 | `/opt/company/skills/minimax-xlsx/SKILL.md` |
 | 专题汇报 PPT、周报的 PPT 制作 | `/opt/company/skills/pptx-generator/SKILL.md` |
 | 新建或修改 Word（.docx） | `/opt/company/skills/doc/SKILL.md` |
 | 读取 PDF、提取 PDF 里的表格、合并/拆分 PDF、生成 PDF | `/opt/company/skills/pdf/SKILL.md` |
 
-部门自己的技能在 `~/<部门>/04_技能/` 里，**部门技能和本目录冲突时，以部门技能为准**。
+部门自己的技能和配方在 `~/<部门>/04_技能/` 里（`dept.py start` 会列出来），**部门技能和本目录冲突时，以部门技能为准**。
 一次只读需要的那一个 SKILL.md；SKILL.md 里提到的 references/*.md 只在确实需要时再读。
 
 ### 公司工具包 `/opt/company/kit/`（直接调用，不要复制改写）
 
 | 工具 | 用途 |
 |---|---|
+| `python3 /opt/company/kit/dept.py start` | **任务开始先跑**：部门说明（已确认的口径）+ 部门配方清单 |
+| `from runio import io_args, save_summary` | script.py 可重跑写法：接收 --input/--out，写 结果摘要.json |
 | `python3 /opt/company/kit/peek.py 文件` | 数据文件摘要（行数、列类型、空值、样例、可能的问题）。**任何 Excel/CSV 先跑它** |
 | `from charts import line, bar, bar_compare, combo` | 公司配色出图（先 `sys.path.insert(0, "/opt/company/kit")`） |
 | `from tables import save_excel` | 公司格式 Excel（列宽撑开、表头、冻结、内部标注） |
@@ -54,6 +57,7 @@
 
 ## 三、常见情况
 
+0. 临时文件用 `mktemp -d` 建自己的临时目录（同部门可能有别人同时在用终端），不要写固定文件名到 /tmp。
 1. 读 Excel 先跑 `peek.py`，不要用 pandas 把整张表打印出来；大文件只打印汇总结果（不超过 30 行）。
 2. 金额、数量列读进来是文本时，先转成数字，转不了的列出来给用户看。
 3. 中文 CSV 读不出来，试 `encoding="gbk"`。

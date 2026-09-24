@@ -8,6 +8,8 @@
   3. 按实际 usage 计价（人民币），逐条记录调用日志（可追溯）
   4. 自检页  http://NAS:8031/        连通性、密钥、额度概览
   5. 管理页  http://NAS:8031/admin   费用明细、改上限、导出 CSV（需管理员密码）
+     月度价值  http://NAS:8031/admin/value   活跃人数、成果数、每个成果的费用、部门说明与配方的积累
+     配置检查  管理页按钮：和一键初始化时的基线比较，发现有人在 Open WebUI 界面上手工改过配置
   6. 模拟模式 GATE_MOCK=1（只在本机测试用）：不连智谱，返回假回复 + 按字数估算的费用，
      整条链路（登录、部门权限、终端工具调用、计费、限额拦截）都能在没有 API key 时测试
 
@@ -21,6 +23,7 @@ import hmac
 import html
 import io
 import json
+import math
 import os
 import re
 import sqlite3
@@ -34,7 +37,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse, RedirectResponse
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 CN_TZ = timezone(timedelta(hours=8))  # 中国不用夏令时，固定 UTC+8
 
 
@@ -67,6 +70,10 @@ MOCK_NOTE = "模拟模式（未连接智谱，费用为估算）"
 CHAT_MAX_YUAN = float(_env("CHAT_MAX_YUAN", "5"))
 # 单次请求的输入上限（估算 tokens）：对话太长或把大表格读进对话时拦下来；0 = 不限
 MAX_INPUT_TOKENS = int(float(_env("MAX_INPUT_TOKENS", "100000")))
+# 月度价值页：部门共享文件夹只读挂载在这里（只统计 02_输出、03_周报、04_技能、05_模板 的目录名和条目数，不读文件内容）
+DEPTS_ROOT = _env("DEPTS_ROOT", "/depts")
+# 一键初始化后的 Open WebUI 配置基线（配置检查用）
+BASELINE_DIR = os.path.join(os.path.dirname(DB_PATH) or "/data", "owui_config")
 try:
     EXTRA_BODY = json.loads(_env("GATE_EXTRA_BODY", "{}") or "{}")
 except Exception:
@@ -627,7 +634,7 @@ th{background:#F7F9FC;color:#555;font-weight:600}td.num,th.num{text-align:right}
 .muted{color:#888;font-size:12px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
 .kpi{background:#F7F9FC;border-radius:8px;padding:14px}.kpi b{font-size:24px;display:block}
 input,button,select{font:inherit;padding:5px 9px;border:1px solid #C9D1DB;border-radius:5px}button{background:#2F6FB0;color:#fff;border:0;cursor:pointer}
-.scroll{overflow-x:auto}
+.scroll{overflow-x:auto}table.wrap td{white-space:normal}table.wrap td:first-child{white-space:nowrap;width:150px;color:#555}
 #internal-mark-bar{position:fixed;right:12px;bottom:10px;font-size:12px;color:#8a8a8a;background:rgba(255,255,255,.9);border:1px solid #e0e0e0;border-radius:4px;padding:2px 10px}
 """
 
@@ -851,9 +858,13 @@ async def admin(request: Request, month: str = "", msg: str = ""):
     if is_admin:
         admin_tools = f"""<form method="post" action="/admin/testkey" style="margin:0"><button type="submit" style="background:#D9822B">测试智谱密钥（约 ¥0.001，记入总裁办额度）</button></form></div>
 <div class="card"><h2>平台初始化（Open WebUI）</h2>
-<p class="muted">第一次部署时点一次；以后改了提示词或新增部门，再点一次即可（可重复执行，不会重复创建）。会自动：建部门组 → 部门终端只给本部门用 → 建部门助手 → 装「部门额度显示」过滤器。</p>
+<p class="muted">第一次部署时点一次；以后改了提示词或新增部门，再点一次即可（可重复执行，不会重复创建）。会自动：建部门组 → 部门终端只给本部门用 → 建部门助手 → 快捷指令 → 装「部门额度显示」过滤器 → 页面顶部横幅 → 保存配置基线（配置检查用）。</p>
 <form method="post" action="/admin/setup" style="display:flex;gap:8px;flex-wrap:wrap">
 <input name="email" placeholder="Open WebUI 管理员邮箱" size="28"><input name="password" type="password" placeholder="管理员密码" size="18"><button>一键初始化</button></form></div>
+<div class="card"><h2>配置检查</h2>
+<p class="muted">和最近一次「一键初始化」后的配置基线比较，看有没有人在 Open WebUI 界面上手工改过助手、提示词、快捷指令、权限、过滤器。升级 Open WebUI 版本后也点一次。</p>
+<form method="post" action="/admin/drift" style="display:flex;gap:8px;flex-wrap:wrap">
+<input name="email" placeholder="Open WebUI 管理员邮箱" size="28"><input name="password" type="password" placeholder="管理员密码" size="18"><button style="background:#8C8C8C">检查配置</button></form></div>
 <div class="card"><h2>批量导入员工账号</h2>
 <p class="muted">每行一个人：<b>姓名,登录名,部门,初始密码</b>。登录名可以用工号（登录时输入「工号@localhost」），部门填 {esc("、".join(d["name"] for c, d in DEPTS.items() ))}。重复导入不会重复建号。</p>
 <form method="post" action="/admin/users"><textarea name="lines" rows="6" style="width:100%;font:13px monospace;padding:8px;border:1px solid #C9D1DB;border-radius:5px" placeholder="张三,1001,资材部,Abc12345&#10;李四,1002,财务部,Abc12345"></textarea>
@@ -864,6 +875,7 @@ async def admin(request: Request, month: str = "", msg: str = ""):
     body = f"""{notice}
 <div class="card" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
 <form method="get" style="margin:0">月份 <select name="month" onchange="this.form.submit()">{opts}</select></form>
+<a href="/admin/value?month={esc(month)}"><button type="button" style="background:#3A9A5B">月度价值 →</button></a>
 <a href="/admin/export.csv?month={esc(month)}"><button type="button">导出本月明细（Excel 可打开）</button></a>
 {admin_tools}<div class="card"><div class="grid">
 <div class="kpi">本月调用次数<b>{tot['n']:,}</b></div><div class="kpi">本月费用<b>¥{tot['s']:.2f}</b></div>
@@ -879,6 +891,247 @@ async def admin(request: Request, month: str = "", msg: str = ""):
 <div class="scroll"><table><tr><th>时间</th><th>用户</th><th>部门</th><th>状态</th><th>原因</th></tr>{brs2}</table></div></div>
 <div class="card"><h2>最近 50 次调用</h2><div class="scroll"><table><tr><th>时间</th><th>用户</th><th>部门</th><th>用途</th><th class="num">输入</th><th class="num">缓存命中</th><th class="num">输出</th><th class="num">费用</th><th class="num">耗时</th><th>状态</th><th>备注</th></tr>{rrs}</table></div></div>"""
     return page("费用管理", body, admin_link=False)
+
+
+# ----------------------------------------------------------------- 月度价值页
+def dept_folder(code):
+    """部门代码 → 共享文件夹名（资材部 → 资材，总裁办 → 总裁办），与部门终端一致"""
+    return DEPTS[code]["name"].rstrip("部")
+
+
+def _week_month(name):
+    """周次文件夹名（2026-W38）→ 该周周四所在月份；认不出返回 None"""
+    m = re.match(r"^(\d{4})-?W(\d{1,2})", name)
+    if not m:
+        return None
+    try:
+        return datetime.fromisocalendar(int(m.group(1)), int(m.group(2)), 4).strftime("%Y-%m")
+    except ValueError:
+        return None
+
+
+def _dir_month(path, name):
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})_", name)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    wm = _week_month(name)
+    if wm:
+        return wm
+    try:
+        return datetime.fromtimestamp(os.stat(path).st_mtime, CN_TZ).strftime("%Y-%m")
+    except OSError:
+        return None
+
+
+def dept_assets(code):
+    """扫部门文件夹（只看目录名、条目数）：{mounted, outputs:{月份:个数}, recipes, notes, weekly_set}"""
+    root = os.path.join(DEPTS_ROOT, dept_folder(code))
+    info = {"mounted": os.path.isdir(root), "outputs": {}, "recipes": 0, "notes": 0, "weekly_set": False}
+    if not info["mounted"]:
+        return info
+    for sub in ("02_输出", "03_周报"):
+        base = os.path.join(root, sub)
+        try:
+            names = os.listdir(base)
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(base, n)
+            if n.startswith(".") or not os.path.isdir(p):
+                continue
+            mo = _dir_month(p, n)
+            if mo:
+                info["outputs"][mo] = info["outputs"].get(mo, 0) + 1
+    try:
+        sk = os.path.join(root, "04_技能")
+        info["recipes"] = sum(1 for n in os.listdir(sk) if not n.startswith(".") and os.path.isfile(os.path.join(sk, n, "验收.json")))
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(root, "05_模板", "部门说明.md"), encoding="utf-8") as f:
+            info["notes"] = sum(1 for ln in f if ln.lstrip().startswith("- "))
+    except OSError:
+        pass
+    info["weekly_set"] = os.path.isfile(os.path.join(root, "05_模板", "周报说明.md"))
+    return info
+
+
+def usage_by_dept(months):
+    """按部门、月份汇总 gate.db：活跃人数、对话数、费用、被拦截次数、触顶对话数"""
+    qs = ",".join("?" for _ in months)
+    with db() as c:
+        rows = c.execute(f"""SELECT dept, month,
+            COUNT(DISTINCT CASE WHEN task='chat' AND status=200 AND user_email<>'' THEN user_email END) users,
+            COUNT(DISTINCT CASE WHEN task='chat' AND status=200 AND chat_id<>'' THEN chat_id END) chats,
+            COALESCE(SUM(cost),0) cost,
+            SUM(CASE WHEN status IN (402,413) THEN 1 ELSE 0 END) blocked,
+            COUNT(DISTINCT CASE WHEN status=402 AND note LIKE '这个对话已用%' THEN chat_id END) capped
+            FROM calls WHERE month IN ({qs}) GROUP BY dept, month""", months).fetchall()
+    out = {}
+    for r in rows:
+        out[(r["dept"], r["month"])] = dict(r)
+    return out
+
+
+def last_months(month, n=6):
+    y, m = map(int, month.split("-"))
+    res = []
+    for _ in range(n):
+        res.append(f"{y:04d}-{m:02d}")
+        y, m = (y - 1, 12) if m == 1 else (y, m - 1)
+    return res[::-1]
+
+
+def svg_stacked(labels, series, unit, title, height=200, decimals=0):
+    """堆叠柱状图：series = [(名称, 颜色, [值…])]；每根柱顶标合计"""
+    W, H, pad, top = 540, height, 44, 22
+    tot = [sum(s[2][i] for s in series) for i in range(len(labels))]
+    raw = max(tot + [0]) or 1
+    step = 10 ** math.floor(math.log10(raw / 4))
+    step = next(k * step for k in (1, 2, 2.5, 5, 10) if k * step * 4 >= raw)  # 刻度取整：1/2/2.5/5 × 10^n
+    mx = step * 4
+    tick = (lambda v: f"{v:,.{0 if step >= 1 else 2}f}")
+    bw = (W - pad * 2) / max(len(labels), 1)
+    fmt = (lambda v: f"{v:,.{decimals}f}")
+    parts = [f'<svg viewBox="0 0 {W} {H + 56}" width="100%" role="img" aria-label="{esc(title)}">',
+             f'<text x="{pad}" y="14" font-size="13" font-weight="700" fill="#1F3B5C">{esc(title)}</text>',
+             f'<text x="{W - pad}" y="14" font-size="11" text-anchor="end" fill="#888">单位：{esc(unit)}</text>']
+    for g in range(5):
+        gy = H - (H - top - 10) * g / 4
+        parts.append(f'<line x1="{pad}" x2="{W - pad}" y1="{gy:.1f}" y2="{gy:.1f}" stroke="#EEE"/>'
+                     f'<text x="{pad - 6}" y="{gy + 4:.1f}" font-size="10" text-anchor="end" fill="#999">{tick(mx * g / 4)}</text>')
+    for i, lab in enumerate(labels):
+        x = pad + i * bw + bw * 0.2
+        w = bw * 0.6
+        base = H
+        for name, color, vals in series:
+            h = (H - top - 10) * vals[i] / mx
+            if h > 0:
+                parts.append(f'<rect x="{x:.1f}" y="{base - h:.1f}" width="{w:.1f}" height="{h:.1f}" fill="{color}">'
+                             f'<title>{esc(lab)} {esc(name)} {fmt(vals[i])}</title></rect>')
+                base -= h
+        parts.append(f'<text x="{x + w / 2:.1f}" y="{base - 4:.1f}" font-size="11" text-anchor="middle" fill="#333">{fmt(tot[i])}</text>'
+                     f'<text x="{x + w / 2:.1f}" y="{H + 15}" font-size="11" text-anchor="middle" fill="#666">{esc(lab)}</text>')
+    lx = pad
+    for name, color, _ in series:
+        parts.append(f'<rect x="{lx}" y="{H + 30}" width="11" height="10" fill="{color}"/>'
+                     f'<text x="{lx + 15}" y="{H + 39}" font-size="11" fill="#555">{esc(name)}</text>')
+        lx += 18 + 13 * len(name) + 20
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+@app.get("/admin/value", response_class=HTMLResponse)
+async def admin_value(request: Request, month: str = ""):
+    if not view_ok(request):
+        return need_auth()
+    month = month if re.match(r"^\d{4}-\d{2}$", month or "") else month_of()
+    months6 = last_months(month, 6)
+    use = usage_by_dept(months6)
+    assets = {code: dept_assets(code) for code in DEPTS}
+    with db() as c:
+        all_months = [r["month"] for r in c.execute("SELECT DISTINCT month FROM calls ORDER BY month DESC").fetchall()]
+    if month_of() not in all_months:
+        all_months.insert(0, month_of())
+    if month not in all_months:
+        all_months.append(month)
+    opts = "".join(f'<option {"selected" if m == month else ""}>{m}</option>' for m in all_months)
+
+    def u(code, mo, k):
+        return (use.get((code, mo)) or {}).get(k) or 0
+
+    def outs(code, mo):
+        return assets[code]["outputs"].get(mo, 0)
+
+    rows, T = [], {"users": 0, "chats": 0, "outs": 0, "cost": 0.0, "blocked": 0, "capped": 0, "recipes": 0, "notes": 0}
+    for i, code in enumerate(DEPTS):
+        a = assets[code]
+        o = outs(code, month) if a["mounted"] else None
+        r = {k: u(code, month, k) for k in ("users", "chats", "cost", "blocked", "capped")}
+        for k in r:
+            T[k] += r[k]
+        T["outs"] += o or 0
+        T["recipes"] += a["recipes"]
+        T["notes"] += a["notes"]
+        per_chat = f"¥{r['cost'] / r['chats']:.2f}" if r["chats"] else "—"
+        per_out = f"¥{r['cost'] / o:.2f}" if o else "—"
+        o_txt = "<span class='muted'>未挂载</span>" if o is None else f"{o}"
+        rows.append(
+            f"<tr><td><i style='display:inline-block;width:10px;height:10px;background:{DEPT_COLORS[i % len(DEPT_COLORS)]};margin-right:6px'></i>{esc(DEPTS[code]['name'])}</td>"
+            f"<td class='num'>{r['users']}</td><td class='num'>{r['chats']}</td><td class='num'><b>{o_txt}</b></td>"
+            f"<td class='num'>¥{r['cost']:.2f}</td><td class='num'>{per_chat}</td><td class='num'>{per_out}</td>"
+            f"<td class='num {'warn' if r['blocked'] else ''}'>{r['blocked']}</td><td class='num {'warn' if r['capped'] else ''}'>{r['capped']}</td>"
+            f"<td class='num'>{a['recipes'] if a['mounted'] else '—'}</td><td class='num'>{a['notes'] if a['mounted'] else '—'}</td>"
+            f"<td>{('<span class=ok>已设置</span>' if a['weekly_set'] else '<span class=muted>未设置</span>') if a['mounted'] else '—'}</td></tr>")
+    per_out_all = f"¥{T['cost'] / T['outs']:.2f}" if T["outs"] else "—"
+    labels = [m[2:].replace("-", "/") for m in months6]
+    ser_out = [(DEPTS[c]["name"], DEPT_COLORS[i % len(DEPT_COLORS)], [outs(c, m) for m in months6]) for i, c in enumerate(DEPTS)]
+    ser_cost = [(DEPTS[c]["name"], DEPT_COLORS[i % len(DEPT_COLORS)], [round(u(c, m, "cost"), 2) for m in months6]) for i, c in enumerate(DEPTS)]
+    mounted = all(a["mounted"] for a in assets.values())
+    warn_mount = "" if mounted else ("<div class='card' style='border-left:4px solid #D9822B'>部分部门文件夹没有挂载到费用闸门（docker-compose.yml 里 cost-gate 的 "
+                                     "/depts 只读挂载），成果数、配方数显示为「未挂载」。同步新版 docker-compose.yml 后，项目停止 → 构建即可。</div>")
+    body = f"""{warn_mount}
+<div class="card" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+<form method="get" style="margin:0">月份 <select name="month" onchange="this.form.submit()">{opts}</select></form>
+<a href="/admin?month={esc(month)}"><button type="button" style="background:#8C8C8C">← 返回费用管理</button></a>
+<span class="muted">回答「平台值不值」：有多少人在用、做出了多少成果、每个成果花多少钱、经验积累了多少</span></div>
+<div class="card"><div class="grid">
+<div class="kpi">活跃人数<b>{T['users']}</b><span class="muted">本月发过对话的员工</span></div>
+<div class="kpi">完成成果<b>{T['outs']}</b><span class="muted">02_输出 + 03_周报 新增文件夹</span></div>
+<div class="kpi">本月费用<b>¥{T['cost']:.2f}</b><span class="muted">每个成果平均 {per_out_all}</span></div>
+<div class="kpi">经验积累<b>{T['recipes']} 配方 · {T['notes']} 条口径</b><span class="muted">部门配方 · 部门说明（累计）</span></div>
+</div></div>
+<div class="card" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:18px">
+<div>{svg_stacked(labels, ser_out, "个", "近 6 个月完成成果数")}</div>
+<div>{svg_stacked(labels, ser_cost, "元", "近 6 个月费用", decimals=2)}</div></div>
+<div class="card"><h2>{esc(month)} 各部门明细</h2><div class="scroll"><table>
+<tr><th>部门</th><th class="num">活跃人数</th><th class="num">对话数</th><th class="num">完成成果</th><th class="num">费用</th>
+<th class="num">每个对话</th><th class="num">每个成果</th><th class="num">被拦截</th><th class="num">触顶对话</th>
+<th class="num">部门配方</th><th class="num">部门说明条目</th><th>周报说明</th></tr>{''.join(rows)}
+<tr style="font-weight:700;background:#F7F9FC"><td>合计</td><td class="num">{T['users']}</td><td class="num">{T['chats']}</td><td class="num">{T['outs']}</td>
+<td class="num">¥{T['cost']:.2f}</td><td class="num">{f"¥{T['cost'] / T['chats']:.2f}" if T['chats'] else '—'}</td><td class="num">{per_out_all}</td>
+<td class="num">{T['blocked']}</td><td class="num">{T['capped']}</td><td class="num">{T['recipes']}</td><td class="num">{T['notes']}</td><td></td></tr>
+</table></div></div>
+<div class="card"><h2>口径说明</h2><table class="wrap">
+<tr><td>活跃人数</td><td>当月至少有一次成功对话的员工数（按登录账号去重；自动生成标题等后台调用不算）</td></tr>
+<tr><td>对话数</td><td>当月有成功调用的对话个数（同一个对话来回多次只算 1 个）</td></tr>
+<tr><td>完成成果</td><td>部门文件夹 02_输出 和 03_周报 下当月新增的子文件夹个数（助手每个任务建一个）。按文件夹名里的日期/周次归月，认不出时按修改时间；只看文件夹名，不读文件内容</td></tr>
+<tr><td>每个对话 / 每个成果</td><td>当月费用 ÷ 对话数 / ÷ 完成成果数。成果增加而单价下降 = 平台越用越省</td></tr>
+<tr><td>被拦截</td><td>因部门额度用完、单对话上限（¥{CHAT_MAX_YUAN:g}）或单次输入太长被拦下的请求次数</td></tr>
+<tr><td>触顶对话</td><td>达到单对话上限的对话个数：多的话说明对话拖得太长或任务太大，适合拆分或存成部门配方</td></tr>
+<tr><td>部门配方 / 部门说明条目</td><td>当前累计：04_技能 里带「验收.json」的配方个数；05_模板/部门说明.md 里的条目数（每条都是用户确认过的口径）</td></tr>
+</table></div>"""
+    return page("月度价值", body, admin_link=False)
+
+
+# ----------------------------------------------------------------- 配置检查
+@app.post("/admin/drift", response_class=HTMLResponse)
+async def admin_drift(request: Request):
+    if not admin_ok(request):
+        return need_auth()
+    from owui_setup import Setup
+    f = await _form(request)
+    st = Setup(OWUI_URL, f.get("email", ""), f.get("password", ""), DEPTS, EXEC_DEPT)
+    try:
+        when, diffs = await st.check_drift(BASELINE_DIR)
+    except Exception as e:
+        return _result_page("配置检查", [(False, str(e))])
+    finally:
+        await st.client.aclose()
+    if not diffs:
+        body = (f"<div class='card'><h2>配置检查</h2><p class='ok'>✔ 和基线（{esc(when)} 一键初始化后）完全一致，没有人在界面上改过本平台的配置。</p>"
+                "<p><a href='/admin'><button>返回管理页</button></a></p></div>")
+        return page("配置检查", body, admin_link=False)
+    trs = "".join(
+        f"<tr><td>{esc(p)}</td><td>{'<span class=muted>（无）</span>' if a is None else esc(a)}</td>"
+        f"<td class='{'bad' if b is None else 'warn'}'>{'（已删除）' if b is None else esc(b)}</td></tr>" for p, a, b in diffs[:200])
+    body = f"""<div class="card"><h2>配置检查：发现 {len(diffs)} 处和基线不同</h2>
+<p class="muted">基线 = {esc(when)} 最近一次「一键初始化」后的配置。下面是之后在 Open WebUI 界面上被改动的地方。
+<br>处理办法：改动是有意的 → 把它写进代码（owui_setup.py），本机测试后同步 NAS，再点一键初始化（会覆盖成代码里的设置并更新基线）；
+不是有意的 → 直接点一键初始化恢复。</p>
+<div class="scroll"><table><tr><th>位置</th><th>基线</th><th>现在</th></tr>{trs}</table></div>
+<p><a href="/admin"><button>返回管理页</button></a></p></div>"""
+    return page("配置检查", body, admin_link=False)
 
 
 @app.post("/admin/budget")
@@ -965,7 +1218,7 @@ async def admin_setup(request: Request):
         return need_auth()
     from owui_setup import Setup
     f = await _form(request)
-    log = await Setup(OWUI_URL, f.get("email", ""), f.get("password", ""), DEPTS, EXEC_DEPT).run_all(GATE_INTERNAL_URL, list(DEPTS))
+    log = await Setup(OWUI_URL, f.get("email", ""), f.get("password", ""), DEPTS, EXEC_DEPT).run_all(GATE_INTERNAL_URL, list(DEPTS), BASELINE_DIR)
     return _result_page("平台初始化结果", log)
 
 

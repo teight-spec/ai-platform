@@ -37,6 +37,7 @@ echo    8. 同步到 NAS（先预览，确认后才复制）
 echo    9. 打开网页（平台 localhost:%P_WEB% / 自检 localhost:%P_GATE%）
 echo    A. 构建办公版终端镜像（改了 term-image 后，或第一次）
 echo    B. 导出办公版终端镜像给 NAS（生成 .tar）
+echo    C. 运行测试（公司工具包回归 + 各部门配方回归，改了 company 后先跑）
 echo    0. 退出
 echo.
 set "c="
@@ -52,6 +53,7 @@ if "%c%"=="8" goto sync
 if "%c%"=="9" goto open
 if /i "%c%"=="A" goto buildimg
 if /i "%c%"=="B" goto saveimg
+if /i "%c%"=="C" goto tests
 if "%c%"=="0" exit /b 0
 goto menu
 
@@ -95,6 +97,26 @@ set "code=000"
 for /f %%h in ('curl -s -o nul -w "%%{http_code}" --max-time 10 https://%~1 2^>nul') do set "code=%%h"
 echo       %code%   %~2
 exit /b 0
+
+rem ------------------------------------------------------------ C 测试
+:tests
+echo.
+echo [1/2] 公司工具包回归测试（在资材终端里跑，只用 /tmp 临时文件）
+%DC% exec -T term-zc python3 /opt/company/tests/test_kit.py
+if errorlevel 1 (
+  echo.
+  echo [有问题] 上面有失败项，先别同步 NAS。平台没启动时先选 2。
+  goto done
+)
+echo.
+echo [2/2] 各部门配方回归（用配方自带的样例重跑，和验收值比对；没有配方的部门会显示「暂无」）
+for %%t in (term-zc term-cw term-yx term-zb) do (
+  echo ---- %%t
+  %DC% exec -T %%t python3 /opt/company/kit/dept.py recipe-check
+)
+echo.
+echo [完成] 全部通过再选 8 同步 NAS。
+goto done
 
 rem ------------------------------------------------------------ 2 启动
 :start
