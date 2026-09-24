@@ -1,0 +1,18 @@
+# 密钥与本机配置（绝不进仓库）
+.env
+.env.local
+# 运行数据、模拟文件夹、离线镜像
+data/
+data-local/
+nas-sim/
+镜像/
+*.tar
+# 生成物与 Office 文档
+__pycache__/
+*.pyc
+*.zip
+*.docx
+*.pptx
+*.pdf
+~$*
+Thumbs.db

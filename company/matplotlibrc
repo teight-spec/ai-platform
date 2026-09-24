@@ -1,0 +1,13 @@
+# 公司统一图表设置
+font.family: sans-serif
+font.sans-serif: WenQuanYi Zen Hei, DejaVu Sans
+axes.unicode_minus: False
+axes.prop_cycle: cycler('color', ['2F6FB0', '3A9A5B', 'D9822B', '8C8C8C', '7B5EA7', 'C0392B'])
+figure.dpi: 110
+savefig.dpi: 200
+savefig.bbox: tight
+axes.spines.top: False
+axes.spines.right: False
+axes.grid: True
+grid.color: EEEEEE
+axes.axisbelow: True

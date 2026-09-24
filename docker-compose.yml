@@ -1,0 +1,217 @@
+# ==========================================================================
+#  公司内部 AI 平台（P0 验证版）· docker-compose
+#  部署位置：群晖 NAS 的 /volume1/docker/ai-platform
+#  访问：平台 http://<NAS-IP>:8030 ；费用闸门 自检/管理 http://<NAS-IP>:8031
+#  所有密钥与可调参数都在同目录的 .env 里，本文件一般不用改。
+# ==========================================================================
+name: ai-platform
+
+x-term-common: &term-common
+  # 办公增强版终端镜像：在 Open Terminal（.env 的 IMAGE_TERMINAL）基础上补 xlrd/pdfplumber/reportlab/pptxgenjs/中文字体
+  # 本机已有该镜像就直接用；没有就按 term-image/Dockerfile 自动构建（需要能访问国内软件源）
+  image: ${IMAGE_TERMINAL_OFFICE:-ai-term-office:1.1}
+  build:
+    context: ./term-image
+    args:
+      BASE_IMAGE: ${IMAGE_TERMINAL}
+      # 容器内运行账号 = 群晖终端服务账号（DSM 里 `id <服务账号>` 查到的 uid/gid）
+      TERM_UID: ${TERM_UID:-1000}
+      TERM_GID: ${TERM_GID:-100}
+  restart: unless-stopped
+  # 群晖 Container Manager「终端机」要求容器带 TTY，否则报「未发现电传终端机」
+  tty: true
+  stdin_open: true
+  mem_limit: 1g
+  cpu_shares: 512
+  networks: [backend]
+  depends_on:
+    init-folders:
+      condition: service_completed_successfully
+
+services:
+  # ---- 1. 部门文件夹初始化（运行一次就退出，属正常）----------------------
+  init-folders:
+    image: ${IMAGE_OPENWEBUI}
+    container_name: ai-init-folders
+    restart: "no"
+    user: "0:0"
+    entrypoint: ["python", "/company/init_folders.py"]
+    network_mode: none
+    environment:
+      TERMINAL_UID: ${TERM_UID:-1000}   # 部门终端容器内的运行账号 = 群晖终端服务账号
+      TERMINAL_GID: ${TERM_GID:-100}
+    volumes:
+      - ./company:/company:ro
+      - ./data/init:/report
+      - ${NAS_VOLUME}/AI资材:/depts/资材
+      - ${NAS_VOLUME}/AI财务:/depts/财务
+      - ${NAS_VOLUME}/AI营销:/depts/营销
+      - ${NAS_VOLUME}/AI总裁办:/depts/总裁办
+
+  # ---- 2. 费用闸门（唯一出网点：按部门计价、限额、自检页、管理页）------------
+  cost-gate:
+    image: ${IMAGE_OPENWEBUI}          # 复用 Open WebUI 镜像里的 Python，不用另外构建
+    container_name: ai-cost-gate
+    restart: unless-stopped
+    entrypoint: ["python", "/gate/app.py"]
+    working_dir: /gate
+    ports:
+      - "${GATE_PORT}:8000"
+    environment:
+      TZ: Asia/Shanghai
+      ZHIPU_API_KEY: ${ZHIPU_API_KEY}
+      UPSTREAM_BASE: https://open.bigmodel.cn/api/paas/v4
+      GATE_MODELS: glm-5.3-flash
+      GATE_DEPTS: "zc|资材部|${BUDGET_ZC}|${DEPT_KEY_ZC};cw|财务部|${BUDGET_CW}|${DEPT_KEY_CW};yx|营销部|${BUDGET_YX}|${DEPT_KEY_YX};zb|总裁办|${BUDGET_ZB}|${DEPT_KEY_ZB}"
+      GATE_EXEC_DEPT: zb
+      GATE_ADMIN_PASSWORD: ${GATE_ADMIN_PASSWORD}
+      GATE_VIEWER_PASSWORD: ${GATE_VIEWER_PASSWORD}
+      PRICE_INPUT: ${PRICE_INPUT}
+      PRICE_OUTPUT: ${PRICE_OUTPUT}
+      PRICE_CACHED: ${PRICE_CACHED}
+      WARN_PCT: "80"
+      # 用量保护：单个对话累计费用上限（元）、单次请求输入上限（估算 tokens）；0 = 不限
+      CHAT_MAX_YUAN: ${CHAT_MAX_YUAN:-5}
+      MAX_INPUT_TOKENS: ${MAX_INPUT_TOKENS:-100000}
+      GATE_EXTRA_BODY: '{"thinking":{"type":"enabled","clear_thinking":false}}'
+      GATE_DB_PATH: /data/gate.db
+      OWUI_URL: http://open-webui:8080
+      GATE_INTERNAL_URL: http://cost-gate:8000
+      INIT_REPORT: /init-report/init_report.json
+    volumes:
+      - ./cost-gate:/gate:ro
+      - ./data/cost-gate:/data
+      - ./data/init:/init-report:ro
+    mem_limit: 384m
+    cpu_shares: 512
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [frontend, backend]
+
+  # ---- 3. Open WebUI（登录、界面、部门权限、定时任务）----------------------
+  open-webui:
+    image: ${IMAGE_OPENWEBUI}
+    container_name: ai-open-webui
+    restart: unless-stopped
+    depends_on:
+      cost-gate:
+        condition: service_started
+    ports:
+      - "${WEBUI_PORT}:8080"
+    environment:
+      TZ: Asia/Shanghai
+      WEBUI_NAME: AI 助手平台
+      WEBUI_URL: ${WEBUI_URL}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      DEFAULT_LOCALE: zh-CN
+      # 账号：管理员建号，关闭自助注册（第一个注册的账号自动成为管理员，不受此限制）
+      ENABLE_SIGNUP: "False"
+      DEFAULT_USER_ROLE: user
+      # 模型：4 条连接都指向费用闸门，每个部门一把密钥；前缀 = 部门代码
+      ENABLE_OLLAMA_API: "False"
+      OPENAI_API_BASE_URLS: "http://cost-gate:8000/v1;http://cost-gate:8000/v1;http://cost-gate:8000/v1;http://cost-gate:8000/v1"
+      OPENAI_API_KEYS: "${DEPT_KEY_ZC};${DEPT_KEY_CW};${DEPT_KEY_YX};${DEPT_KEY_ZB}"
+      OPENAI_API_CONFIGS: '{"0":{"enable":true,"prefix_id":"zc","model_ids":["glm-5.3-flash"],"headers":{"X-OWUI-Task":"{{TASK}}"}},"1":{"enable":true,"prefix_id":"cw","model_ids":["glm-5.3-flash"],"headers":{"X-OWUI-Task":"{{TASK}}"}},"2":{"enable":true,"prefix_id":"yx","model_ids":["glm-5.3-flash"],"headers":{"X-OWUI-Task":"{{TASK}}"}},"3":{"enable":true,"prefix_id":"zb","model_ids":["glm-5.3-flash"],"headers":{"X-OWUI-Task":"{{TASK}}"}}}'
+      ENABLE_FORWARD_USER_INFO_HEADERS: "True"
+      # 部门终端（初始化时再由费用闸门管理页的「一键初始化」设置访问权限）
+      TERMINAL_SERVER_CONNECTIONS: '[{"id":"term-zc","name":"资材终端","url":"http://term-zc:8000","key":"${TERM_KEY_ZC}","auth_type":"bearer","enabled":true,"config":{"chat_uploads":"filesystem"}},{"id":"term-cw","name":"财务终端","url":"http://term-cw:8000","key":"${TERM_KEY_CW}","auth_type":"bearer","enabled":true,"config":{"chat_uploads":"filesystem"}},{"id":"term-yx","name":"营销终端","url":"http://term-yx:8000","key":"${TERM_KEY_YX}","auth_type":"bearer","enabled":true,"config":{"chat_uploads":"filesystem"}},{"id":"term-zb","name":"总裁办终端","url":"http://term-zb:8000","key":"${TERM_KEY_ZB}","auth_type":"bearer","enabled":true,"config":{"chat_uploads":"filesystem"}}]'
+      # 省内存：不在本机加载向量模型/语音模型，不联网下载模型
+      RAG_EMBEDDING_ENGINE: openai
+      RAG_OPENAI_API_BASE_URL: http://cost-gate:8000/v1
+      RAG_OPENAI_API_KEY: ${DEPT_KEY_ZB}
+      RAG_EMBEDDING_MODEL: embedding-3
+      OFFLINE_MODE: "True"
+      ENABLE_VERSION_UPDATE_CHECK: "False"
+      # 省钱：关掉不需要的后台 AI 调用（保留自动生成对话标题）
+      ENABLE_TAGS_GENERATION: "False"
+      ENABLE_FOLLOW_UP_GENERATION: "False"
+      ENABLE_SEARCH_QUERY_GENERATION: "False"
+      ENABLE_RETRIEVAL_QUERY_GENERATION: "False"
+      ENABLE_AUTOCOMPLETE_GENERATION: "False"
+      # 关掉用不到的功能
+      ENABLE_WEB_SEARCH: "False"
+      ENABLE_IMAGE_GENERATION: "False"
+      ENABLE_CODE_INTERPRETER: "False"
+      ENABLE_CODE_EXECUTION: "False"
+      ENABLE_EVALUATION_ARENA_MODELS: "False"
+      ENABLE_COMMUNITY_SHARING: "False"
+      ENABLE_DIRECT_CONNECTIONS: "False"
+      # 管理员（含总裁办账号）可以查看全部对话
+      ENABLE_ADMIN_CHAT_ACCESS: "True"
+    volumes:
+      - ./data/open-webui:/app/backend/data
+    mem_limit: 2g
+    cpu_shares: 1024
+    networks: [frontend, backend]
+
+  # ---- 4. 部门终端（断外网；只挂本部门文件夹）-----------------------------
+  term-zc:
+    <<: *term-common
+    container_name: ai-term-zc
+    working_dir: /home/user/资材/01_原始数据
+    environment:
+      TZ: Asia/Shanghai
+      OPEN_TERMINAL_API_KEY: ${TERM_KEY_ZC}
+      OPEN_TERMINAL_INFO: "这是资材部的终端。部门文件夹：/home/user/资材（01_原始数据、02_输出、03_周报、04_技能、05_模板）。标注脚本：/opt/company/stamp_internal.py。"
+      MATPLOTLIBRC: /opt/company/matplotlibrc
+      MPLCONFIGDIR: /tmp/matplotlib
+    volumes:
+      - ${NAS_VOLUME}/AI资材:/home/user/资材
+      - ./company:/opt/company:ro
+      - ./company/fonts:/usr/local/share/fonts/company:ro
+
+  term-cw:
+    <<: *term-common
+    container_name: ai-term-cw
+    working_dir: /home/user/财务/01_原始数据
+    environment:
+      TZ: Asia/Shanghai
+      OPEN_TERMINAL_API_KEY: ${TERM_KEY_CW}
+      OPEN_TERMINAL_INFO: "这是财务部的终端。部门文件夹：/home/user/财务（01_原始数据、02_输出、03_周报、04_技能、05_模板）。标注脚本：/opt/company/stamp_internal.py。"
+      MATPLOTLIBRC: /opt/company/matplotlibrc
+      MPLCONFIGDIR: /tmp/matplotlib
+    volumes:
+      - ${NAS_VOLUME}/AI财务:/home/user/财务
+      - ./company:/opt/company:ro
+      - ./company/fonts:/usr/local/share/fonts/company:ro
+
+  term-yx:
+    <<: *term-common
+    container_name: ai-term-yx
+    working_dir: /home/user/营销/01_原始数据
+    environment:
+      TZ: Asia/Shanghai
+      OPEN_TERMINAL_API_KEY: ${TERM_KEY_YX}
+      OPEN_TERMINAL_INFO: "这是营销部的终端。部门文件夹：/home/user/营销（01_原始数据、02_输出、03_周报、04_技能、05_模板）。标注脚本：/opt/company/stamp_internal.py。"
+      MATPLOTLIBRC: /opt/company/matplotlibrc
+      MPLCONFIGDIR: /tmp/matplotlib
+    volumes:
+      - ${NAS_VOLUME}/AI营销:/home/user/营销
+      - ./company:/opt/company:ro
+      - ./company/fonts:/usr/local/share/fonts/company:ro
+
+  term-zb:
+    <<: *term-common
+    container_name: ai-term-zb
+    working_dir: /home/user/总裁办/01_原始数据
+    environment:
+      TZ: Asia/Shanghai
+      OPEN_TERMINAL_API_KEY: ${TERM_KEY_ZB}
+      OPEN_TERMINAL_INFO: "这是总裁办的终端。各部门文件夹只读：/home/user/各部门/资材、/home/user/各部门/财务、/home/user/各部门/营销；总裁办自己的文件夹（可写）：/home/user/总裁办。标注脚本：/opt/company/stamp_internal.py。"
+      MATPLOTLIBRC: /opt/company/matplotlibrc
+      MPLCONFIGDIR: /tmp/matplotlib
+    volumes:
+      - ${NAS_VOLUME}/AI总裁办:/home/user/总裁办
+      - ${NAS_VOLUME}/AI资材:/home/user/各部门/资材:ro
+      - ${NAS_VOLUME}/AI财务:/home/user/各部门/财务:ro
+      - ${NAS_VOLUME}/AI营销:/home/user/各部门/营销:ro
+      - ./company:/opt/company:ro
+      - ./company/fonts:/usr/local/share/fonts/company:ro
+
+networks:
+  frontend: {}
+  backend:
+    internal: true        # 终端所在网络，不能访问外网

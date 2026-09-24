@@ -1,0 +1,26 @@
+# ==========================================================================
+#  本机模拟专用覆盖文件（Rancher Desktop）—— 只写和 NAS 不一样的地方
+#  由「本机测试工具.bat」自动叠加在 docker-compose.yml 之上使用
+#  NAS 上不要用本文件；「同步到 NAS」也不会复制它
+# ==========================================================================
+#  与 NAS 的差异：
+#   1. 部门共享文件夹 → 本机 nas-sim\AI资材 等（由 .env.local 的 NAS_VOLUME 决定）
+#   2. 平台数据       → 本机 data-local\（和 NAS 的 data\ 完全分开，互不覆盖）
+#   3. 费用闸门       → 默认打开模拟模式（GATE_MOCK=1），没有智谱 key 也能测
+# ==========================================================================
+services:
+  init-folders:
+    volumes:
+      - ./data-local/init:/report
+
+  cost-gate:
+    environment:
+      GATE_MOCK: ${GATE_MOCK:-1}
+      GATE_MOCK_DELAY_MS: ${GATE_MOCK_DELAY_MS:-25}
+    volumes:
+      - ./data-local/cost-gate:/data
+      - ./data-local/init:/init-report:ro
+
+  open-webui:
+    volumes:
+      - ./data-local/open-webui:/app/backend/data

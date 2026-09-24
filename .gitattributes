@@ -1,0 +1,6 @@
+# 代码统一用 LF（容器里是 Linux，CRLF 会让 .sh 脚本出错）
+* text=auto eol=lf
+# bat 是 GBK + CRLF，原样保存
+*.bat -text
+*.ttc binary
+*.png binary
